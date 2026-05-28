@@ -45,6 +45,10 @@ dependencies = [
   "dna_features_viewer",
   "accelerate",
 ]
+
+[project.scripts]
+esmfold2-binder-design = "esm.binder_design:main"
+
 # Pytest
 [tool.pytest.ini_options]
 addopts = """

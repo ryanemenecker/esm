@@ -271,6 +271,43 @@ with open("result.cif", "w") as f:
     f.write(result.complex.to_mmcif())
 ```
 
+### Binder Design CLI
+
+This repository now includes a local binder-design CLI that follows the Appendix A.3.1.1 optimization loop from the ESMFold2 preprint: three ESMFold2 distogram losses for foldability and interface formation, plus the masked pseudo-perplexity ESMC prior.
+
+This workflow is intended for a CUDA workstation with bfloat16 support and FlashAttention. The local development machine for this repo does not have that hardware, so validate and benchmark the full pipeline on the target GPU box.
+
+Install the package plus the GPU kernels on the target machine:
+
+```bash
+pip install -e .
+pip install flash-attn xformers 'transformer-engine[pytorch]'
+huggingface-cli login
+```
+
+Run a minibinder search against a target sequence or cropped target domain:
+
+```bash
+esmfold2-binder-design \
+    --target-fasta target.fa \
+    --binder-length 48 \
+    --num-designs 32 \
+    --search-model biohub/ESMFold2 \
+    --ranking-model biohub/ESMFold2 \
+    --output-dir runs/pdgfrb_48mer
+```
+
+Use `--binder-prompt` instead of `--binder-length` when you need fixed framework positions. The prompt accepts standard amino acids for fixed residues and `#` for mutable residues. Repeat `--search-model` or `--ranking-model` to use multiple ESMFold2 checkpoints; the loader keeps only a limited number resident on GPU at once so multi-checkpoint runs stay memory-safe on a single workstation.
+
+Key options:
+
+- `--binder-type minibinder|antibody` selects the paper defaults for the ESMC prior weight and pI filtering.
+- `--proxy-row-indices 25-32,50-56` restricts the Algorithm 15 distogram proxy to a binder residue subset, which is useful for antibody CDR-only scoring.
+- `--disable-search-lm-context` keeps the explicit ESMC regularizer but skips the extra discrete LM context inside the ESMFold2 search pass when you want a faster, lower-memory search.
+- `--write-top-structures N` writes mmCIF files for the top `N` ranked candidates from the first ranking checkpoint.
+
+The CLI writes three files into `--output-dir`: `run_config.json`, `raw_trajectories.jsonl`, and ranked candidate outputs in both `ranked_candidates.jsonl` and `ranked_candidates.csv`. Each ranked design includes the binder sequence, source trajectories, ipTM, the distogram ipTM proxy, pTM, mean pLDDT, pairwise chain ipTM, and pI.
+
 For tutorials on how to use ESMFold2, see our [tutorials](https://github.com/Biohub/esm/tree/main/cookbook/tutorials).
 
 
