@@ -1228,12 +1228,12 @@ def straight_through_onehot(soft_probs: torch.Tensor) -> torch.Tensor:
 def soft_binder_to_vocab_distribution(
     soft_binder: torch.Tensor,
     *,
-    cls_token_id: int,
+    bos_token_id: int,
     eos_token_id: int,
     vocab_size: int,
 ) -> torch.Tensor:
     distribution = soft_binder.new_zeros((soft_binder.shape[0] + 2, vocab_size))
-    distribution[0, cls_token_id] = 1.0
+    distribution[0, bos_token_id] = 1.0
     distribution[-1, eos_token_id] = 1.0
     distribution[1:-1, STANDARD_AA_TOKEN_IDS] = soft_binder
     return distribution.unsqueeze(0)
@@ -1279,9 +1279,10 @@ def masked_pseudo_perplexity_loss(
     if mutable_indices.numel() == 0:
         return soft_binder.new_tensor(0.0)
 
+    binder_st = straight_through_onehot(soft_binder)
     base_distribution = soft_binder_to_vocab_distribution(
-        soft_binder,
-        cls_token_id=tokenizer.cls_token_id,
+        binder_st,
+        bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         vocab_size=masked_lm_model.config.vocab_size,
     )
