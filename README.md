@@ -303,8 +303,9 @@ Key options:
 
 - `--binder-type minibinder|antibody` selects the paper defaults for the ESMC prior weight and pI filtering.
 - Live progress bars are shown during the search and ranking stages by default, with the search bar updating on every optimization step. Use `--no-progress` to disable them.
+- Final ranking defaults to the paper-style longer folds for minibinders: 3 recycle loops and 200 diffusion steps per candidate.
 - `--proxy-row-indices 25-32,50-56` restricts the Algorithm 15 distogram proxy to a binder residue subset, which is useful for antibody CDR-only scoring.
-- `--disable-search-lm-context` keeps the explicit ESMC regularizer but skips the extra discrete LM context inside the ESMFold2 search pass when you want a faster, lower-memory search.
+- `--disable-search-lm-context` keeps the explicit ESMC regularizer but skips the extra soft ESMC context inside the ESMFold2 search pass when you want a faster, lower-memory search.
 - `--write-top-structures N` writes mmCIF files for the top `N` ranked candidates from the first ranking checkpoint.
 
 The CLI writes three files into `--output-dir`: `run_config.json`, `raw_trajectories.jsonl`, and ranked candidate outputs in both `ranked_candidates.jsonl` and `ranked_candidates.csv`. Each ranked design includes the binder sequence, source trajectories, ipTM, the distogram ipTM proxy, pTM, mean pLDDT, pairwise chain ipTM, and pI.

@@ -1,22 +1,15 @@
 """Gradient-guided ESMFold2 binder design CLI.
 
 This module implements the binder-design protocol described in Appendix A.3.1.1
-of the ESMFold2 preprint. The released ESMFold2 API is optimized for inference:
-its public ``forward`` is wrapped in ``torch.inference_mode`` and the protein
-input pipeline atomizes each residue from a discrete amino-acid identity. To
-keep the design loop differentiable without patching upstream model code, this
-implementation rebuilds a discrete binder scaffold from the current argmax
-sequence at each step and injects the continuous binder distribution through the
-model's differentiable ``res_type`` path.
+of the ESMFold2 preprint. The released public ESMFold2 API is inference-first,
+so the search loop reconstructs the relevant backbone computations locally to
+keep the target+binder search state soft throughout the ESMFold2 distogram pass.
+Search-time atom features for the binder are built as continuous mixtures over
+protein atom templates, and the optional ESMFold2-internal LM context is also
+constructed from a soft target+binder sequence representation.
 
-The result matches the paper's optimization objectives while staying inside the
-released model surface:
-
-* ESMFold2 supplies the distogram-based intra-contact, inter-contact, and
-  globularity losses.
-* ESMC supplies the masked pseudo-perplexity sequence prior.
-* Low-temperature candidate selection uses the full ESMFold2 confidence head to
-  keep the best ipTM sequence from the trajectory.
+The resulting search loop tracks the paper's optimization recipe while leaving
+the final discrete ranking folds on the standard released inference path.
 """
 
 from __future__ import annotations
@@ -116,6 +109,9 @@ CONTACT_MASK_LOGIT = -1.0e7
 MINI_BINDER_LM_WEIGHT = 0.15
 ANTIBODY_LM_WEIGHT = 0.05
 MINI_BINDER_PI_THRESHOLD = 6.0
+SEARCH_ATOM_OCCUPANCY_THRESHOLD = 1.0e-3
+ESMC_BOS_TOKEN_ID = 0
+ESMC_EOS_TOKEN_ID = 2
 
 
 @dataclass
@@ -137,8 +133,8 @@ class SearchConfig:
 
 @dataclass
 class RankingConfig:
-    num_loops: int = 1
-    num_sampling_steps: int = 50
+    num_loops: int = 3
+    num_sampling_steps: int = 200
     selection_score: str = "mean"
     write_top_structures: int = 0
 
@@ -150,6 +146,47 @@ class PreparedComplex:
     binder_slice: slice
     target_length: int
     binder_length: int
+    target_ref_pos: torch.Tensor
+    target_ref_charge: torch.Tensor
+    target_ref_space_uid: torch.Tensor
+    target_atom_to_token: torch.Tensor
+    target_ref_element_oh: torch.Tensor
+    target_ref_atom_name_chars_oh: torch.Tensor
+    target_atom_feature_mask: torch.Tensor
+    target_atom_index_mask: torch.Tensor
+    target_distogram_atom_idx: torch.Tensor
+    target_input_ids: torch.Tensor
+
+
+@dataclass
+class SoftSearchState:
+    distogram_logits: torch.Tensor
+    x_inputs: torch.Tensor
+    z: torch.Tensor
+    relative_position_encoding: torch.Tensor
+    token_bonds_encoding: torch.Tensor
+    ref_pos: torch.Tensor
+    ref_charge: torch.Tensor
+    ref_element: torch.Tensor
+    ref_atom_name_chars: torch.Tensor
+    ref_space_uid: torch.Tensor
+    atom_feature_mask: torch.Tensor
+    atom_index_mask: torch.Tensor
+    atom_to_token: torch.Tensor
+    distogram_atom_idx: torch.Tensor
+
+
+@dataclass
+class ProteinAtomTemplateLibrary:
+    atom_name_to_index: dict[str, int]
+    atom_presence: torch.Tensor
+    ref_pos: torch.Tensor
+    charge: torch.Tensor
+    element_oh: torch.Tensor
+    atom_name_chars_oh: torch.Tensor
+
+
+_PROTEIN_ATOM_TEMPLATE_LIBRARY: ProteinAtomTemplateLibrary | None = None
 
 
 @dataclass
@@ -405,7 +442,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Start running full confidence passes once the search temperature falls below this value.",
     )
     parser.add_argument("--confidence-steps", type=int, default=50, help="Diffusion steps for low-temperature confidence passes.")
-    parser.add_argument("--ranking-steps", type=int, default=50, help="Diffusion steps for final candidate ranking.")
+    parser.add_argument("--ranking-steps", type=int, default=200, help="Diffusion steps for final candidate ranking.")
     parser.add_argument(
         "--selection-score",
         choices=("iptm", "proxy", "mean"),
@@ -429,7 +466,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--disable-search-lm-context",
         action="store_true",
-        help="Skip the discrete LM context inside the ESMFold2 search pass for speed. The explicit ESMC LM loss still runs.",
+        help="Skip the soft ESMC context inside the ESMFold2 search pass for speed. The explicit ESMC LM loss still runs.",
     )
     return parser.parse_args(argv)
 
@@ -558,16 +595,116 @@ def binder_distribution_to_res_type_soft(soft_binder: torch.Tensor) -> torch.Ten
     return res_type
 
 
-def prepare_complex(handle: FoldModelHandle, target_sequence: str, binder_sequence: str) -> PreparedComplex:
-    from esm.models.esmfold2 import ProteinInput, StructurePredictionInput
+def weighted_scatter_atom_to_token(
+    atom_features: torch.Tensor,
+    atom_to_token: torch.Tensor,
+    *,
+    n_tokens: int,
+    atom_weight: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, atom_count, feature_dim = atom_features.shape
+    token_indices = atom_to_token.unsqueeze(-1).expand(batch_size, atom_count, feature_dim)
+    weighted_features = atom_features * atom_weight.unsqueeze(-1)
 
+    out = torch.zeros(
+        batch_size,
+        n_tokens,
+        feature_dim,
+        device=atom_features.device,
+        dtype=atom_features.dtype,
+    )
+    out.scatter_add_(1, token_indices, weighted_features)
+
+    denom = torch.zeros(
+        batch_size,
+        n_tokens,
+        1,
+        device=atom_features.device,
+        dtype=atom_features.dtype,
+    )
+    denom.scatter_add_(1, atom_to_token.unsqueeze(-1), atom_weight.unsqueeze(-1))
+    return out / denom.clamp(min=1.0e-6)
+
+
+def get_protein_atom_template_library() -> ProteinAtomTemplateLibrary:
+    global _PROTEIN_ATOM_TEMPLATE_LIBRARY
+    if _PROTEIN_ATOM_TEMPLATE_LIBRARY is not None:
+        return _PROTEIN_ATOM_TEMPLATE_LIBRARY
+
+    from esm.models.esmfold2.conformers import get_idealized_atom_pos
+    from esm.models.esmfold2.constants import CHARGED_ATOMS, PROTEIN_1TO3, PROTEIN_HEAVY_ATOMS
+    from esm.models.esmfold2.prepare_input import encode_atom_name, get_element_atomic_num, _infer_element
+    from transformers.models.esmfold2.modeling_esmfold2_common import (  # pyright: ignore[reportMissingImports]
+        CHAR_VOCAB_SIZE,
+        MAX_ATOMIC_NUMBER,
+    )
+
+    atom_names: list[str] = []
+    seen: set[str] = set()
+    for atom_name in ("N", "CA", "C", "O"):
+        atom_names.append(atom_name)
+        seen.add(atom_name)
+    for aa in STANDARD_AA_ORDER:
+        residue_name = PROTEIN_1TO3[aa]
+        for atom_name in PROTEIN_HEAVY_ATOMS[residue_name]:
+            if atom_name not in seen:
+                atom_names.append(atom_name)
+                seen.add(atom_name)
+
+    atom_name_to_index = {atom_name: index for index, atom_name in enumerate(atom_names)}
+    n_slots = len(atom_names)
+    n_residues = len(STANDARD_AA_ORDER)
+    atom_presence = torch.zeros((n_residues, n_slots), dtype=torch.float32)
+    ref_pos = torch.zeros((n_residues, n_slots, 3), dtype=torch.float32)
+    charge = torch.zeros((n_residues, n_slots), dtype=torch.float32)
+    element_oh = torch.zeros((n_slots, MAX_ATOMIC_NUMBER), dtype=torch.float32)
+    atom_name_chars_oh = torch.zeros((n_slots, 4, CHAR_VOCAB_SIZE), dtype=torch.float32)
+
+    for slot_index, atom_name in enumerate(atom_names):
+        atomic_num = get_element_atomic_num(_infer_element(atom_name))
+        if 0 <= atomic_num < MAX_ATOMIC_NUMBER:
+            element_oh[slot_index, atomic_num] = 1.0
+        for char_index, char_code in enumerate(encode_atom_name(atom_name)):
+            atom_name_chars_oh[slot_index, char_index, char_code] = 1.0
+
+    for residue_index, aa in enumerate(STANDARD_AA_ORDER):
+        residue_name = PROTEIN_1TO3[aa]
+        residue_type = AA_TO_RES_TYPE[aa]
+        for atom_name in PROTEIN_HEAVY_ATOMS[residue_name]:
+            slot_index = atom_name_to_index[atom_name]
+            atom_presence[residue_index, slot_index] = 1.0
+            idealized = get_idealized_atom_pos(residue_type, atom_name)
+            if idealized is not None:
+                ref_pos[residue_index, slot_index] = torch.as_tensor(idealized, dtype=torch.float32)
+            charge[residue_index, slot_index] = float(CHARGED_ATOMS.get((residue_name, atom_name), 0))
+
+    _PROTEIN_ATOM_TEMPLATE_LIBRARY = ProteinAtomTemplateLibrary(
+        atom_name_to_index=atom_name_to_index,
+        atom_presence=atom_presence,
+        ref_pos=ref_pos,
+        charge=charge,
+        element_oh=element_oh,
+        atom_name_chars_oh=atom_name_chars_oh,
+    )
+    return _PROTEIN_ATOM_TEMPLATE_LIBRARY
+
+
+def prepare_complex(target_sequence: str, binder_length: int, device: torch.device) -> PreparedComplex:
+    from esm.models.esmfold2 import ESMFold2InputBuilder, ProteinInput, StructurePredictionInput
+    from transformers.models.esmfold2.modeling_esmfold2_common import (  # pyright: ignore[reportMissingImports]
+        CHAR_VOCAB_SIZE,
+        MAX_ATOMIC_NUMBER,
+    )
+
+    dummy_binder = "G" * binder_length
     spi = StructurePredictionInput(
         sequences=[
             ProteinInput(id="A", sequence=target_sequence),
-            ProteinInput(id="B", sequence=binder_sequence),
+            ProteinInput(id="B", sequence=dummy_binder),
         ]
     )
-    features, chain_infos = handle.builder.prepare_input(spi, device=handle.model.device)
+    builder = ESMFold2InputBuilder()
+    features, chain_infos = builder.prepare_input(spi, device=device)
     if len(chain_infos) != 2:
         raise ValueError(f"Expected two chains in the prepared complex, got {len(chain_infos)}")
     target_tokens = chain_infos[0].tokens
@@ -576,64 +713,306 @@ def prepare_complex(handle: FoldModelHandle, target_sequence: str, binder_sequen
         raise ValueError("Prepared complex is missing target or binder tokens.")
     target_slice = slice(target_tokens[0].token_index, target_tokens[-1].token_index + 1)
     binder_slice = slice(binder_tokens[0].token_index, binder_tokens[-1].token_index + 1)
+
+    target_atom_mask = features["atom_attention_mask"] & (features["atom_to_token"] < binder_slice.start)
+    target_ref_element_oh = F.one_hot(
+        features["ref_element"][target_atom_mask].long(), num_classes=MAX_ATOMIC_NUMBER
+    ).float()
+    target_ref_atom_name_chars_oh = F.one_hot(
+        features["ref_atom_name_chars"][target_atom_mask].long(), num_classes=CHAR_VOCAB_SIZE
+    ).float()
+
     return PreparedComplex(
         features=features,
         target_slice=target_slice,
         binder_slice=binder_slice,
         target_length=len(target_tokens),
         binder_length=len(binder_tokens),
+        target_ref_pos=features["ref_pos"][target_atom_mask].clone(),
+        target_ref_charge=features["ref_charge"][target_atom_mask].float().clone(),
+        target_ref_space_uid=features["ref_space_uid"][target_atom_mask].clone(),
+        target_atom_to_token=features["atom_to_token"][target_atom_mask].clone(),
+        target_ref_element_oh=target_ref_element_oh.clone(),
+        target_ref_atom_name_chars_oh=target_ref_atom_name_chars_oh.clone(),
+        target_atom_feature_mask=torch.ones(target_atom_mask.sum().item(), device=device, dtype=torch.float32),
+        target_atom_index_mask=torch.ones(target_atom_mask.sum().item(), device=device, dtype=torch.bool),
+        target_distogram_atom_idx=features["distogram_atom_idx"][target_slice].clone(),
+        target_input_ids=features["input_ids"][target_slice].clone(),
     )
 
 
-def build_soft_res_type_tensor(prepared: PreparedComplex, soft_binder: torch.Tensor) -> torch.Tensor:
-    template = F.one_hot(prepared.features["res_type"].long(), num_classes=NUM_RES_TYPES).float()
-    template[:, prepared.binder_slice, :] = binder_distribution_to_res_type_soft(soft_binder).unsqueeze(0)
-    return template
-
-
-def esmfold2_distogram_pass(
-    model: Any,
-    prepared: PreparedComplex,
-    soft_res_type: torch.Tensor,
-    *,
-    input_ids: torch.Tensor | None,
-    num_loops: int,
-) -> torch.Tensor:
+def build_soft_atom_block(prepared: PreparedComplex, soft_binder: torch.Tensor) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     from transformers.models.esmfold2.modeling_esmfold2_common import (  # pyright: ignore[reportMissingImports]
         CHAR_VOCAB_SIZE,
         MAX_ATOMIC_NUMBER,
     )
 
+    template_library = get_protein_atom_template_library()
+    device = soft_binder.device
+    dtype = soft_binder.dtype
+    atom_presence = template_library.atom_presence.to(device=device, dtype=dtype)
+    template_ref_pos = template_library.ref_pos.to(device=device, dtype=dtype)
+    template_charge = template_library.charge.to(device=device, dtype=dtype)
+    template_element_oh = template_library.element_oh.to(device=device, dtype=dtype)
+    template_atom_name_chars_oh = template_library.atom_name_chars_oh.to(device=device, dtype=dtype)
+
+    binder_occupancy = soft_binder @ atom_presence
+    binder_ref_pos = torch.einsum("la,asd->lsd", soft_binder, template_ref_pos)
+    binder_ref_charge = soft_binder @ template_charge
+    binder_ref_element = binder_occupancy.unsqueeze(-1) * template_element_oh.unsqueeze(0)
+    binder_ref_atom_name_chars = binder_occupancy.unsqueeze(-1).unsqueeze(-1) * template_atom_name_chars_oh.unsqueeze(0)
+
+    token_indices = torch.arange(
+        prepared.binder_slice.start,
+        prepared.binder_slice.stop,
+        device=device,
+        dtype=torch.long,
+    )
+    n_slots = binder_occupancy.shape[1]
+    binder_ref_space_uid = token_indices[:, None].expand(-1, n_slots)
+    binder_atom_to_token = token_indices[:, None].expand(-1, n_slots)
+    binder_atom_feature_mask = binder_occupancy
+    binder_atom_index_mask = binder_occupancy > SEARCH_ATOM_OCCUPANCY_THRESHOLD
+
+    ref_pos = torch.cat(
+        [prepared.target_ref_pos.to(device=device, dtype=dtype), binder_ref_pos.reshape(-1, 3)], dim=0
+    )
+    ref_charge = torch.cat(
+        [prepared.target_ref_charge.to(device=device, dtype=dtype), binder_ref_charge.reshape(-1)], dim=0
+    )
+    ref_space_uid = torch.cat(
+        [prepared.target_ref_space_uid.to(device=device), binder_ref_space_uid.reshape(-1)], dim=0
+    )
+    atom_to_token = torch.cat(
+        [prepared.target_atom_to_token.to(device=device), binder_atom_to_token.reshape(-1)], dim=0
+    )
+    ref_element = torch.cat(
+        [prepared.target_ref_element_oh.to(device=device, dtype=dtype), binder_ref_element.reshape(-1, MAX_ATOMIC_NUMBER)],
+        dim=0,
+    )
+    ref_atom_name_chars = torch.cat(
+        [
+            prepared.target_ref_atom_name_chars_oh.to(device=device, dtype=dtype),
+            binder_ref_atom_name_chars.reshape(-1, 4, CHAR_VOCAB_SIZE),
+        ],
+        dim=0,
+    )
+    atom_feature_mask = torch.cat(
+        [prepared.target_atom_feature_mask.to(device=device, dtype=dtype), binder_atom_feature_mask.reshape(-1)],
+        dim=0,
+    )
+    atom_index_mask = torch.cat(
+        [prepared.target_atom_index_mask.to(device=device), binder_atom_index_mask.reshape(-1)],
+        dim=0,
+    )
+
+    total_atoms = max(32, math.ceil(ref_pos.shape[0] / 32) * 32)
+    padding = total_atoms - ref_pos.shape[0]
+    if padding > 0:
+        ref_pos = torch.cat([ref_pos, torch.zeros(padding, 3, device=device, dtype=dtype)], dim=0)
+        ref_charge = torch.cat([ref_charge, torch.zeros(padding, device=device, dtype=dtype)], dim=0)
+        ref_space_uid = torch.cat([ref_space_uid, torch.zeros(padding, device=device, dtype=torch.long)], dim=0)
+        atom_to_token = torch.cat([atom_to_token, torch.zeros(padding, device=device, dtype=torch.long)], dim=0)
+        ref_element = torch.cat(
+            [ref_element, torch.zeros(padding, MAX_ATOMIC_NUMBER, device=device, dtype=dtype)], dim=0
+        )
+        ref_atom_name_chars = torch.cat(
+            [ref_atom_name_chars, torch.zeros(padding, 4, CHAR_VOCAB_SIZE, device=device, dtype=dtype)], dim=0
+        )
+        atom_feature_mask = torch.cat([atom_feature_mask, torch.zeros(padding, device=device, dtype=dtype)], dim=0)
+        atom_index_mask = torch.cat([atom_index_mask, torch.zeros(padding, device=device, dtype=torch.bool)], dim=0)
+
+    binder_cb_occupancy = binder_occupancy[:, template_library.atom_name_to_index["CB"]]
+    binder_base = prepared.target_ref_pos.shape[0] + torch.arange(
+        prepared.binder_length,
+        device=device,
+        dtype=torch.long,
+    ) * n_slots
+    binder_rep = torch.where(
+        binder_cb_occupancy > 0.5,
+        binder_base + template_library.atom_name_to_index["CB"],
+        binder_base + template_library.atom_name_to_index["CA"],
+    )
+    distogram_atom_idx = torch.cat(
+        [prepared.target_distogram_atom_idx.to(device=device), binder_rep.to(device=device)], dim=0
+    )
+
+    return (
+        ref_pos.unsqueeze(0),
+        ref_charge.unsqueeze(0),
+        ref_element.unsqueeze(0),
+        ref_atom_name_chars.unsqueeze(0),
+        ref_space_uid.unsqueeze(0),
+        atom_feature_mask.unsqueeze(0),
+        atom_index_mask.unsqueeze(0),
+        atom_to_token.unsqueeze(0),
+        distogram_atom_idx,
+    )
+
+
+def build_soft_complex_lm_hidden_states(
+    model: Any,
+    prepared: PreparedComplex,
+    soft_binder: torch.Tensor,
+) -> torch.Tensor | None:
+    encoder = getattr(model, "_esmc", None)
+    if encoder is None:
+        return None
+    if getattr(encoder, "_use_flash_attn", False):
+        raise RuntimeError(
+            "The ESMFold2-internal ESMC must use 'sdpa' or 'eager' for the soft multi-chain search pass."
+        )
+
+    device = soft_binder.device
+    vocab_size = encoder.config.vocab_size
+    target_distribution = F.one_hot(prepared.target_input_ids.to(device=device).long(), num_classes=vocab_size).to(soft_binder.dtype)
+    binder_distribution = soft_binder.new_zeros((prepared.binder_length, vocab_size))
+    binder_distribution[:, STANDARD_AA_TOKEN_IDS] = soft_binder
+    bos = soft_binder.new_zeros((1, vocab_size))
+    eos = soft_binder.new_zeros((1, vocab_size))
+    bos[0, ESMC_BOS_TOKEN_ID] = 1.0
+    eos[0, ESMC_EOS_TOKEN_ID] = 1.0
+
+    lm_distribution = torch.cat(
+        [bos, target_distribution, eos, bos, binder_distribution, eos],
+        dim=0,
+    ).unsqueeze(0)
+    sequence_id = torch.cat(
+        [
+            torch.zeros(prepared.target_length + 2, device=device, dtype=torch.long),
+            torch.ones(prepared.binder_length + 2, device=device, dtype=torch.long),
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    gather_positions = torch.cat(
+        [
+            torch.arange(1, 1 + prepared.target_length, device=device, dtype=torch.long),
+            torch.arange(
+                prepared.target_length + 3,
+                prepared.target_length + 3 + prepared.binder_length,
+                device=device,
+                dtype=torch.long,
+            ),
+        ],
+        dim=0,
+    )
+
+    embed_weight = encoder.get_input_embeddings().weight
+    hidden = lm_distribution.to(embed_weight.dtype) @ embed_weight
+    layers_to_collect = list(range(encoder.config.n_layers + 1))
+    with torch.no_grad():
+        with maybe_autocast(device):
+            _last, _pre_norm, collected, _attentions = encoder.transformer(
+                hidden,
+                sequence_id=sequence_id,
+                layers_to_collect=layers_to_collect,
+                output_attentions=False,
+            )
+    hidden_states = torch.stack(collected, dim=0).index_select(2, gather_positions)
+    return hidden_states.permute(1, 2, 0, 3).contiguous()
+
+
+def encode_soft_atom_inputs(
+    model: Any,
+    *,
+    ref_pos: torch.Tensor,
+    atom_feature_mask: torch.Tensor,
+    atom_index_mask: torch.Tensor,
+    ref_space_uid: torch.Tensor,
+    ref_charge: torch.Tensor,
+    ref_element: torch.Tensor,
+    ref_atom_name_chars: torch.Tensor,
+    atom_to_token: torch.Tensor,
+    n_tokens: int,
+) -> torch.Tensor:
+    atom_encoder = model.inputs_embedder.atom_attention_encoder
+    atom_feats = torch.cat(
+        [
+            ref_pos,
+            ref_charge.unsqueeze(-1),
+            atom_feature_mask.unsqueeze(-1),
+            ref_element,
+            ref_atom_name_chars.reshape(ref_atom_name_chars.shape[0], ref_atom_name_chars.shape[1], -1),
+        ],
+        dim=-1,
+    )
+    c_base = atom_encoder.atom_norm(atom_encoder.atom_linear(atom_feats))
+    c_base = c_base * atom_feature_mask.unsqueeze(-1)
+    cos, sin = atom_encoder.atom_transformer._build_3d_rope(ref_pos, ref_space_uid)
+    seqlens = atom_index_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(atom_index_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen = int(seqlens.max().item())
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    attention_params = (cos, sin, indices, cu_seqlens, max_seqlen)
+    q = atom_encoder.atom_transformer(
+        q_l=c_base,
+        c_l=c_base,
+        attention_params=attention_params,
+    )
+    q_to_a = F.relu(atom_encoder.atom_to_token_linear(q)) * atom_feature_mask.unsqueeze(-1)
+    return weighted_scatter_atom_to_token(
+        q_to_a,
+        atom_to_token,
+        n_tokens=n_tokens,
+        atom_weight=atom_feature_mask,
+    )
+
+
+def run_soft_search_model(
+    model: Any,
+    prepared: PreparedComplex,
+    soft_res_type: torch.Tensor,
+    soft_binder: torch.Tensor,
+    *,
+    include_lm_context: bool,
+    num_loops: int,
+) -> SoftSearchState:
     features = prepared.features
     tok_mask = features["token_attention_mask"]
-    atm_mask = features["atom_attention_mask"]
-    atom_to_token = features["atom_to_token"] * atm_mask.long()
+    (
+        ref_pos,
+        ref_charge,
+        ref_element,
+        ref_atom_name_chars,
+        ref_space_uid,
+        atom_feature_mask,
+        atom_index_mask,
+        atom_to_token,
+        distogram_atom_idx,
+    ) = build_soft_atom_block(prepared, soft_binder)
     deletion_mean = torch.zeros(
         soft_res_type.shape[0],
         soft_res_type.shape[1],
         device=soft_res_type.device,
         dtype=torch.float32,
     )
-    ref_element_oh = F.one_hot(features["ref_element"].long(), num_classes=MAX_ATOMIC_NUMBER).float()
-    ref_atom_name_chars_oh = F.one_hot(
-        features["ref_atom_name_chars"].long(), num_classes=CHAR_VOCAB_SIZE
-    ).float()
-    atm_mask_f = atm_mask.float()
-    ref_element_oh = ref_element_oh * atm_mask_f.unsqueeze(-1)
-    ref_atom_name_chars_oh = ref_atom_name_chars_oh * atm_mask_f.unsqueeze(-1).unsqueeze(-1)
 
     with maybe_autocast(model.device):
-        x_inputs = model.inputs_embedder(
-            aatype=soft_res_type,
-            profile=soft_res_type.float(),
-            deletion_mean=deletion_mean,
-            ref_pos=features["ref_pos"],
-            atom_attention_mask=atm_mask,
-            ref_space_uid=features["ref_space_uid"],
-            ref_charge=features["ref_charge"],
-            ref_element=ref_element_oh,
-            ref_atom_name_chars=ref_atom_name_chars_oh,
+        atom_inputs = encode_soft_atom_inputs(
+            model,
+            ref_pos=ref_pos,
+            atom_feature_mask=atom_feature_mask,
+            atom_index_mask=atom_index_mask,
+            ref_space_uid=ref_space_uid,
+            ref_charge=ref_charge,
+            ref_element=ref_element,
+            ref_atom_name_chars=ref_atom_name_chars,
             atom_to_token=atom_to_token,
+            n_tokens=soft_res_type.shape[1],
+        )
+        x_inputs = torch.cat(
+            [atom_inputs, soft_res_type, soft_res_type.float(), deletion_mean.unsqueeze(-1)],
+            dim=-1,
         )
         z_init = model.z_init_1(x_inputs).unsqueeze(2) + model.z_init_2(x_inputs).unsqueeze(1)
         relative_position_encoding = model.rel_pos(
@@ -647,15 +1026,9 @@ def esmfold2_distogram_pass(
         z_init = z_init + relative_position_encoding + token_bonds_encoding
 
         lm_z = None
-        if input_ids is not None and getattr(model, "_esmc", None) is not None:
-            with torch.no_grad():
-                lm_hidden_states = model._compute_lm_hidden_states(
-                    input_ids,
-                    features["asym_id"],
-                    features["residue_index"],
-                    features["mol_type"],
-                    tok_mask,
-                )
+        if include_lm_context:
+            lm_hidden_states = build_soft_complex_lm_hidden_states(model, prepared, soft_binder)
+            if lm_hidden_states is not None:
                 lm_z = model.language_model(lm_hidden_states)
 
         pair_mask = tok_mask[:, :, None].float() * tok_mask[:, None, :].float()
@@ -676,7 +1049,90 @@ def esmfold2_distogram_pass(
         z = model.parcae_readout(z)
         z = model.parcae_coda(z, pair_attention_mask=pair_mask)
         z = z.float()
-        return model.distogram_head(z + z.transpose(-2, -3))
+        distogram_logits = model.distogram_head(z + z.transpose(-2, -3))
+
+    return SoftSearchState(
+        distogram_logits=distogram_logits,
+        x_inputs=x_inputs,
+        z=z,
+        relative_position_encoding=relative_position_encoding,
+        token_bonds_encoding=token_bonds_encoding,
+        ref_pos=ref_pos,
+        ref_charge=ref_charge,
+        ref_element=ref_element,
+        ref_atom_name_chars=ref_atom_name_chars,
+        ref_space_uid=ref_space_uid,
+        atom_feature_mask=atom_feature_mask,
+        atom_index_mask=atom_index_mask,
+        atom_to_token=atom_to_token,
+        distogram_atom_idx=distogram_atom_idx,
+    )
+
+
+def soft_confidence_iptm(
+    model: Any,
+    prepared: PreparedComplex,
+    search_state: SoftSearchState,
+    *,
+    seed: int,
+    num_sampling_steps: int,
+) -> float | None:
+    features = prepared.features
+    rng_devices = [model.device] if model.device.type == "cuda" else []
+    with torch.no_grad():
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.manual_seed(seed)
+            if model.device.type == "cuda":
+                torch.cuda.manual_seed_all(seed)
+            with maybe_autocast(model.device):
+                structure_output = model.structure_head.sample(
+                    z_trunk=search_state.z,
+                    s_inputs=search_state.x_inputs,
+                    s_trunk=None,
+                    relative_position_encoding=search_state.relative_position_encoding,
+                    ref_pos=search_state.ref_pos,
+                    ref_charge=search_state.ref_charge,
+                    ref_mask=search_state.atom_index_mask,
+                    ref_element=search_state.ref_element,
+                    ref_atom_name_chars=search_state.ref_atom_name_chars,
+                    ref_space_uid=search_state.ref_space_uid,
+                    tok_idx=search_state.atom_to_token,
+                    asym_id=features["asym_id"],
+                    residue_index=features["residue_index"],
+                    entity_id=features["entity_id"],
+                    token_index=features["token_index"],
+                    sym_id=features["sym_id"],
+                    token_attention_mask=features["token_attention_mask"],
+                    num_diffusion_samples=1,
+                    num_sampling_steps=num_sampling_steps,
+                    return_atom_repr=False,
+                    denoising_early_exit_rmsd=None,
+                )
+                sample_coords = structure_output["sample_atom_coords"]
+                confidence_output = model.confidence_head(
+                    s_inputs=search_state.x_inputs.detach(),
+                    z=search_state.z.detach(),
+                    x_pred=sample_coords.detach(),
+                    distogram_atom_idx=search_state.distogram_atom_idx,
+                    token_attention_mask=features["token_attention_mask"],
+                    atom_to_token=search_state.atom_to_token,
+                    atom_attention_mask=search_state.atom_index_mask,
+                    asym_id=features["asym_id"],
+                    mol_type=features["mol_type"],
+                    num_diffusion_samples=1,
+                    relative_position_encoding=search_state.relative_position_encoding.detach(),
+                    token_bonds_encoding=search_state.token_bonds_encoding.detach(),
+                )
+    iptm = confidence_output.get("iptm")
+    if iptm is None or iptm.numel() == 0:
+        return None
+    return float(iptm.flatten()[0].item())
+
+
+def build_soft_res_type_tensor(prepared: PreparedComplex, soft_binder: torch.Tensor) -> torch.Tensor:
+    template = F.one_hot(prepared.features["res_type"].long(), num_classes=NUM_RES_TYPES).float()
+    template[:, prepared.binder_slice, :] = binder_distribution_to_res_type_soft(soft_binder).unsqueeze(0)
+    return template
 
 
 def restricted_contact_cross_entropy(distogram_block: torch.Tensor, contact_cutoff: float) -> torch.Tensor:
@@ -1031,6 +1487,7 @@ def trajectory_search(
     device = search_pool.device
     logits, gradient_mask = initialize_binder_logits(binder_prompt, device=device)
     mutable_positions = torch.tensor([token == "#" for token in binder_prompt], device=device)
+    prepared = prepare_complex(target_sequence, len(binder_prompt), device)
     best_sequence = binder_distribution_to_sequence(torch.softmax(logits, dim=-1))
     best_iptm = float("-inf")
     best_step: int | None = None
@@ -1044,16 +1501,16 @@ def trajectory_search(
         hard_binder = binder_distribution_to_sequence(soft_binder)
 
         handle = search_pool.choice(rng)
-        prepared = prepare_complex(handle, target_sequence, hard_binder)
         soft_res_type = build_soft_res_type_tensor(prepared, soft_binder)
-        input_ids = prepared.features["input_ids"] if search_config.use_search_lm_context else None
-        distogram_logits = esmfold2_distogram_pass(
+        search_state = run_soft_search_model(
             handle.model,
             prepared,
             soft_res_type,
-            input_ids=input_ids,
+            soft_binder,
+            include_lm_context=search_config.use_search_lm_context,
             num_loops=search_config.num_loops,
         )
+        distogram_logits = search_state.distogram_logits
 
         loss_intra = intra_contact_loss(distogram_logits, prepared.binder_slice)
         loss_inter = inter_contact_loss(distogram_logits, prepared.target_slice, prepared.binder_slice)
@@ -1082,16 +1539,15 @@ def trajectory_search(
             logits[:, AA_TO_STANDARD_INDEX["C"]] = DEFAULT_CYS_LOGIT
 
         if temperature < search_config.confidence_temperature_threshold:
-            result = full_fold_candidate(
-                handle,
-                target_sequence,
-                hard_binder,
+            iptm = soft_confidence_iptm(
+                handle.model,
+                prepared,
+                search_state,
                 seed=seed + step,
-                num_loops=search_config.num_loops,
                 num_sampling_steps=search_config.confidence_sampling_steps,
             )
-            if result.iptm is not None and float(result.iptm) > best_iptm:
-                best_iptm = float(result.iptm)
+            if iptm is not None and iptm > best_iptm:
+                best_iptm = iptm
                 best_sequence = hard_binder
                 best_step = step
 
