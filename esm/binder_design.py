@@ -685,7 +685,7 @@ def restricted_contact_cross_entropy(distogram_block: torch.Tensor, contact_cuto
         device=distogram_block.device,
         dtype=distogram_block.dtype,
     )
-    restricted_logits = distogram_block - (bin_centers >= contact_cutoff).to(distogram_block.dtype) * CONTACT_MASK_LOGIT
+    restricted_logits = distogram_block + (bin_centers >= contact_cutoff).to(distogram_block.dtype) * CONTACT_MASK_LOGIT
     p_contact = torch.softmax(restricted_logits, dim=-1)
     return -(p_contact * torch.log_softmax(distogram_block, dim=-1)).sum(dim=-1)
 
@@ -873,7 +873,7 @@ def distogram_iptm_proxy(
     )
     contact_mask = (bin_centers < 22.0).to(binder_to_target.dtype)
     p_full = torch.softmax(binder_to_target, dim=-1)
-    p_cut = torch.softmax(binder_to_target - (1.0 - contact_mask) * CONTACT_MASK_LOGIT, dim=-1)
+    p_cut = torch.softmax(binder_to_target + (1.0 - contact_mask) * CONTACT_MASK_LOGIT, dim=-1)
     pair_scores = -(p_cut * torch.log(p_full.clamp(min=1.0e-12))).sum(dim=-1).reshape(-1)
     k = min(binder_to_target.shape[0], pair_scores.numel())
     if k == 0:
