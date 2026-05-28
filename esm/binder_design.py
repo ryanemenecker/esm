@@ -109,7 +109,6 @@ AA_TO_RES_TYPE = {
 STANDARD_AA_RES_TYPES = [AA_TO_RES_TYPE[aa] for aa in STANDARD_AA_ORDER]
 STANDARD_AA_TOKEN_IDS = [ESM_PROTEIN_VOCAB[aa] for aa in STANDARD_AA_ORDER]
 NUM_RES_TYPES = max(PROTEIN_RESIDUE_TO_RES_TYPE.values()) + 12
-DISTOGRAM_BIN_CENTERS = torch.linspace(1.5, 54.5, 128)
 DEFAULT_CYS_LOGIT = -1.0e6
 CONTACT_MASK_LOGIT = -1.0e7
 MINI_BINDER_LM_WEIGHT = 0.15
@@ -579,7 +578,11 @@ def esmfold2_distogram_pass(
 
 
 def restricted_contact_cross_entropy(distogram_block: torch.Tensor, contact_cutoff: float) -> torch.Tensor:
-    bin_centers = DISTOGRAM_BIN_CENTERS.to(distogram_block.device, distogram_block.dtype)
+    bin_centers = distogram_bin_centers(
+        distogram_block.shape[-1],
+        device=distogram_block.device,
+        dtype=distogram_block.dtype,
+    )
     restricted_logits = distogram_block - (bin_centers >= contact_cutoff).to(distogram_block.dtype) * CONTACT_MASK_LOGIT
     p_contact = torch.softmax(restricted_logits, dim=-1)
     return -(p_contact * torch.log_softmax(distogram_block, dim=-1)).sum(dim=-1)
@@ -637,7 +640,11 @@ def inter_contact_loss(distogram_logits: torch.Tensor, target_slice: slice, bind
 
 def globularity_loss(distogram_logits: torch.Tensor, binder_slice: slice) -> torch.Tensor:
     binder_block = distogram_logits[:, binder_slice, binder_slice, :].squeeze(0)
-    bin_centers = DISTOGRAM_BIN_CENTERS.to(binder_block.device, binder_block.dtype)
+    bin_centers = distogram_bin_centers(
+        binder_block.shape[-1],
+        device=binder_block.device,
+        dtype=binder_block.dtype,
+    )
     clamped_sq = torch.minimum(bin_centers, bin_centers.new_tensor(27.0)).pow(2)
     expected_sq_dist = (torch.softmax(binder_block, dim=-1) * clamped_sq).sum(dim=-1)
     triu = torch.triu(expected_sq_dist, diagonal=1)
@@ -757,7 +764,11 @@ def distogram_iptm_proxy(
         if binder_to_target.shape[0] == 0:
             return float("nan")
 
-    bin_centers = DISTOGRAM_BIN_CENTERS.to(binder_to_target.device, binder_to_target.dtype)
+    bin_centers = distogram_bin_centers(
+        binder_to_target.shape[-1],
+        device=binder_to_target.device,
+        dtype=binder_to_target.dtype,
+    )
     contact_mask = (bin_centers < 22.0).to(binder_to_target.dtype)
     p_full = torch.softmax(binder_to_target, dim=-1)
     p_cut = torch.softmax(binder_to_target - (1.0 - contact_mask) * CONTACT_MASK_LOGIT, dim=-1)
@@ -777,6 +788,22 @@ def sequence_pI(sequence: str) -> float | None:
         return float(ProteinAnalysis(sequence).isoelectric_point())
     except Exception:
         return None
+
+
+def distogram_bin_centers(
+    num_bins: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    min_distance: float = 1.5,
+    max_distance: float = 54.5,
+) -> torch.Tensor:
+    # The paper defines distogram midpoints over [1.5, 54.5] A. Some released
+    # checkpoints emit fewer bins than the appendix's 128, so derive the centers
+    # from the live tensor shape instead of hard-coding the bin count.
+    if num_bins <= 0:
+        raise ValueError(f"Distogram bin count must be positive, got {num_bins}.")
+    return torch.linspace(min_distance, max_distance, num_bins, device=device, dtype=dtype)
 
 
 def resolve_fold_esmc_attn_implementation(attn_implementation: str, *, warn: bool = True) -> str:
