@@ -736,8 +736,8 @@ def prepare_complex(target_sequence: str, binder_length: int, device: torch.devi
         target_ref_atom_name_chars_oh=target_ref_atom_name_chars_oh.clone(),
         target_atom_feature_mask=torch.ones(target_atom_mask.sum().item(), device=device, dtype=torch.float32),
         target_atom_index_mask=torch.ones(target_atom_mask.sum().item(), device=device, dtype=torch.bool),
-        target_distogram_atom_idx=features["distogram_atom_idx"][target_slice].clone(),
-        target_input_ids=features["input_ids"][target_slice].clone(),
+        target_distogram_atom_idx=features["distogram_atom_idx"][0, target_slice].clone(),
+        target_input_ids=features["input_ids"][0, target_slice].clone(),
     )
 
 
@@ -856,7 +856,7 @@ def build_soft_atom_block(prepared: PreparedComplex, soft_binder: torch.Tensor) 
         atom_feature_mask.unsqueeze(0),
         atom_index_mask.unsqueeze(0),
         atom_to_token.unsqueeze(0),
-        distogram_atom_idx,
+        distogram_atom_idx.unsqueeze(0),
     )
 
 
