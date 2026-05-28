@@ -26,11 +26,13 @@ import csv
 import json
 import math
 import random
+import sys
+import time
 import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, TextIO
 
 import torch
 import torch.nn.functional as F
@@ -178,6 +180,105 @@ class RankedCandidate:
     model_scores: list[dict[str, Any]] = field(default_factory=list)
 
 
+class ProgressBar:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        stream: TextIO | None = None,
+        width: int = 28,
+    ) -> None:
+        self.enabled = enabled
+        self.stream = sys.stderr if stream is None else stream
+        self.width = width
+        self.label = ""
+        self.total = 1
+        self.completed = 0
+        self.started_at = 0.0
+        self.active = False
+        self._last_line_length = 0
+        self._last_logged_percent = -1
+        self._interactive = bool(self.enabled and getattr(self.stream, "isatty", lambda: False)())
+
+    def start(self, label: str, total: int) -> None:
+        if not self.enabled:
+            return
+        self.label = label
+        self.total = max(1, total)
+        self.completed = 0
+        self.started_at = time.monotonic()
+        self.active = True
+        self._last_line_length = 0
+        self._last_logged_percent = -1
+        self._render(detail="starting", force=True)
+
+    def update(self, advance: int = 1, *, detail: str | None = None) -> None:
+        if not self.enabled or not self.active:
+            return
+        self.completed = min(self.total, self.completed + advance)
+        self._render(detail=detail)
+
+    def finish(self, *, detail: str | None = None) -> None:
+        if not self.enabled or not self.active:
+            return
+        self.completed = self.total
+        self._render(detail=detail, force=True)
+        if self._interactive:
+            self.stream.write("\n")
+            self.stream.flush()
+        self.active = False
+        self._last_line_length = 0
+
+    def _render(self, *, detail: str | None = None, force: bool = False) -> None:
+        elapsed = max(0.0, time.monotonic() - self.started_at)
+        fraction = self.completed / self.total
+        percent = int(100 * fraction)
+        if self._interactive:
+            filled = min(self.width, int(round(self.width * fraction)))
+            bar = "#" * filled + "-" * (self.width - filled)
+            rate = self.completed / elapsed if elapsed > 0 else 0.0
+            eta = (self.total - self.completed) / rate if rate > 0 and self.completed < self.total else 0.0
+            parts = [
+                f"{self.label} [{bar}] {self.completed}/{self.total} {percent:3d}%",
+                f"elapsed {format_duration(elapsed)}",
+            ]
+            if self.completed < self.total and rate > 0:
+                parts.append(f"eta {format_duration(eta)}")
+            if detail:
+                parts.append(detail)
+            line = " | ".join(parts)
+            padding = " " * max(0, self._last_line_length - len(line))
+            self.stream.write("\r" + line + padding)
+            self.stream.flush()
+            self._last_line_length = len(line)
+            return
+
+        milestone = min(100, (percent // 10) * 10)
+        if not force and milestone <= self._last_logged_percent:
+            return
+        self._last_logged_percent = milestone
+        line = f"{self.label}: {self.completed}/{self.total} ({percent}%)"
+        if detail:
+            line = f"{line} | {detail}"
+        self.stream.write(line + "\n")
+        self.stream.flush()
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    minutes, sec = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def format_progress_metric(value: float | None) -> str:
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    return f"{value:.3f}"
+
+
 class FoldModelHandle:
     def __init__(self, model_id: str, model: Any, builder: Any) -> None:
         self.model_id = model_id
@@ -322,6 +423,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override the minibinder pI filter threshold. Use a negative value to disable filtering.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Base random seed.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable live progress reporting.")
     parser.add_argument("--output-dir", type=Path, default=Path("binder_design_outputs"), help="Directory for JSONL, CSV, and optional structure outputs.")
     parser.add_argument("--write-top-structures", type=int, default=0, help="Write mmCIF files for the top ranked binders from the first ranking checkpoint.")
     parser.add_argument(
@@ -923,6 +1025,8 @@ def trajectory_search(
     lm_tokenizer: Any,
     seed: int,
     rng: random.Random,
+    progress: ProgressBar | None = None,
+    num_trajectories: int | None = None,
 ) -> TrajectoryResult:
     device = search_pool.device
     logits, gradient_mask = initialize_binder_logits(binder_prompt, device=device)
@@ -999,6 +1103,19 @@ def trajectory_search(
             "loss_struct": float(loss_struct.item()),
             "loss_lm": float(loss_lm.item()),
         }
+        if progress is not None:
+            best_iptm_value = None if best_step is None else best_iptm
+            trajectory_total = num_trajectories if num_trajectories is not None else "?"
+            progress.update(
+                detail=(
+                    f"traj {trajectory_index + 1}/{trajectory_total} "
+                    f"step {step}/{search_config.steps} "
+                    f"temp={temperature:.3f} "
+                    f"struct={loss_struct.item():.3f} "
+                    f"lm={loss_lm.item():.3f} "
+                    f"best_ipTM={format_progress_metric(best_iptm_value)}"
+                )
+            )
 
     final_soft = torch.softmax(logits.detach() / search_config.temperature_min, dim=-1)
     final_sequence = binder_distribution_to_sequence(final_soft)
@@ -1057,13 +1174,16 @@ def rank_candidates(
     binder_row_subset: Sequence[int] | None,
     pi_threshold: float | None,
     output_dir: Path,
+    progress: ProgressBar | None = None,
 ) -> list[RankedCandidate]:
     ranked: list[RankedCandidate] = []
     structures_dir = output_dir / "structures"
     if ranking_config.write_top_structures > 0:
         structures_dir.mkdir(parents=True, exist_ok=True)
 
-    for candidate in candidates:
+    total_candidates = len(candidates)
+    total_models = len(ranking_pool.model_ids)
+    for candidate_index, candidate in enumerate(candidates, start=1):
         candidate.pI = sequence_pI(candidate.sequence)
         threshold = pi_threshold
         if threshold is None:
@@ -1110,6 +1230,16 @@ def rank_candidates(
             if model_index == 0 and ranking_config.write_top_structures > 0:
                 structure_path = structures_dir / f"{candidate.sequence}.cif"
                 structure_path.write_text(result.complex.to_mmcif())
+
+            if progress is not None:
+                progress.update(
+                    detail=(
+                        f"candidate {candidate_index}/{total_candidates} "
+                        f"model {model_index + 1}/{total_models} "
+                        f"ipTM={format_progress_metric(None if result.iptm is None else float(result.iptm))} "
+                        f"proxy={format_progress_metric(proxy)}"
+                    )
+                )
 
         candidate.model_scores = per_model_scores
         candidate.mean_iptm = nanmean(score["iptm"] for score in per_model_scores)
@@ -1238,6 +1368,7 @@ def build_run_config(args: argparse.Namespace, search_config: SearchConfig, rank
         "ranking_config": ranking_config,
         "proxy_row_indices": args.proxy_row_indices,
         "pi_threshold": args.pi_threshold,
+        "progress": not args.no_progress,
         "seed": args.seed,
     }
 
@@ -1296,10 +1427,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_loaded=args.loaded_fold_models,
     )
     lm_model, lm_tokenizer = load_esmc_masked_lm(args.esmc_model, device, args.attn_implementation)
+    progress = ProgressBar(enabled=not args.no_progress)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     trajectories: list[TrajectoryResult] = []
+    search_total_steps = args.num_designs * search_config.steps
+    if search_total_steps > 0:
+        progress.start("search", search_total_steps)
     for trajectory_index in range(args.num_designs):
         trajectory_seed = args.seed + trajectory_index * 1009
         random_generator = random.Random(trajectory_seed)
@@ -1315,10 +1450,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lm_tokenizer=lm_tokenizer,
                 seed=trajectory_seed,
                 rng=random_generator,
+                progress=progress,
+                num_trajectories=args.num_designs,
             )
         )
+    if search_total_steps > 0:
+        progress.finish(detail=f"completed {len(trajectories)} trajectories")
 
     deduplicated = deduplicate_trajectories(trajectories)
+    ranking_total = len(deduplicated) * len(ranking_pool.model_ids)
+    if ranking_total > 0:
+        progress.start("ranking", ranking_total)
     ranked_candidates = rank_candidates(
         deduplicated,
         target_sequence=target_sequence,
@@ -1328,7 +1470,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         binder_row_subset=binder_row_subset,
         pi_threshold=pi_threshold,
         output_dir=args.output_dir,
+        progress=progress,
     )
+    if ranking_total > 0:
+        progress.finish(detail=f"scored {len(deduplicated)} unique candidates")
     write_outputs(
         args.output_dir,
         config=build_run_config(args, search_config, ranking_config),

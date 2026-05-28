@@ -42,6 +42,12 @@ def _seed_context(seed: int | None):
             torch.cuda.set_rng_state_all(cuda_state)
 
 
+def _maybe_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
 def clean_esmfold2_input(input: StructurePredictionInput) -> StructurePredictionInput:
     """Group identical protein sequences into the same ProteinInput with multiple ids.
 
@@ -334,14 +340,15 @@ class ESMFold2InputBuilder:
 
         with torch.no_grad():
             with _seed_context(seed) if seed is not None else nullcontext():
-                output = model(
-                    **features,
-                    num_loops=num_loops,
-                    num_sampling_steps=num_sampling_steps,
-                    num_diffusion_samples=num_diffusion_samples,
-                    early_exit=early_exit,
-                    **sampler_kwargs,
-                )
+                with _maybe_autocast(model.device):
+                    output = model(
+                        **features,
+                        num_loops=num_loops,
+                        num_sampling_steps=num_sampling_steps,
+                        num_diffusion_samples=num_diffusion_samples,
+                        early_exit=early_exit,
+                        **sampler_kwargs,
+                    )
 
         return self.decode(
             output,

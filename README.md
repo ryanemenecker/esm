@@ -302,6 +302,7 @@ Use `--binder-prompt` instead of `--binder-length` when you need fixed framework
 Key options:
 
 - `--binder-type minibinder|antibody` selects the paper defaults for the ESMC prior weight and pI filtering.
+- Live progress bars are shown during the search and ranking stages by default, with the search bar updating on every optimization step. Use `--no-progress` to disable them.
 - `--proxy-row-indices 25-32,50-56` restricts the Algorithm 15 distogram proxy to a binder residue subset, which is useful for antibody CDR-only scoring.
 - `--disable-search-lm-context` keeps the explicit ESMC regularizer but skips the extra discrete LM context inside the ESMFold2 search pass when you want a faster, lower-memory search.
 - `--write-top-structures N` writes mmCIF files for the top `N` ranked candidates from the first ranking checkpoint.
