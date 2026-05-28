@@ -1392,7 +1392,11 @@ def load_esmfold2_model(
     from transformers.models.esmc.modeling_esmc import ESMCModel  # pyright: ignore[reportMissingImports]
     from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model  # pyright: ignore[reportMissingImports]
 
-    model = ESMFold2Model.from_pretrained(model_id, load_esmc=False).to(device=device, dtype=torch.bfloat16).eval()
+    model = ESMFold2Model.from_pretrained(
+        model_id,
+        load_esmc=False,
+        dtype=torch.bfloat16,
+    ).to(device=device, dtype=torch.bfloat16).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     if kernel_backend is not None:
@@ -1404,6 +1408,7 @@ def load_esmfold2_model(
     esmc = ESMCModel.from_pretrained(
         esmc_model_id,
         attn_implementation=fold_esmc_attn_implementation,
+        dtype=torch.bfloat16,
     )
     esmc = esmc.to(device=device, dtype=torch.bfloat16).eval()
     for parameter in esmc.parameters():
@@ -1418,7 +1423,11 @@ def load_esmc_masked_lm(model_id: str, device: torch.device, attn_implementation
     from transformers.models.esmc.modeling_esmc import ESMCForMaskedLM  # pyright: ignore[reportMissingImports]
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = ESMCForMaskedLM.from_pretrained(model_id, attn_implementation=attn_implementation)
+    model = ESMCForMaskedLM.from_pretrained(
+        model_id,
+        attn_implementation=attn_implementation,
+        dtype=torch.bfloat16,
+    )
     model = model.to(device=device, dtype=torch.bfloat16).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
