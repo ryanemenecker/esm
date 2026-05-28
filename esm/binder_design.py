@@ -782,7 +782,7 @@ def build_soft_atom_block(prepared: PreparedComplex, soft_binder: torch.Tensor) 
     binder_ref_space_uid = token_indices[:, None].expand(-1, n_slots)
     binder_atom_to_token = token_indices[:, None].expand(-1, n_slots)
     binder_atom_feature_mask = binder_occupancy
-    binder_atom_index_mask = binder_occupancy > SEARCH_ATOM_OCCUPANCY_THRESHOLD
+    binder_atom_index_mask = binder_occupancy > 0
 
     ref_pos = torch.cat(
         [prepared.target_ref_pos.to(device=device, dtype=dtype), binder_ref_pos.reshape(-1, 3)], dim=0
@@ -910,14 +910,13 @@ def build_soft_complex_lm_hidden_states(
     embed_weight = encoder.get_input_embeddings().weight
     hidden = lm_distribution.to(embed_weight.dtype) @ embed_weight
     layers_to_collect = list(range(encoder.config.n_layers + 1))
-    with torch.no_grad():
-        with maybe_autocast(device):
-            _last, _pre_norm, collected, _attentions = encoder.transformer(
-                hidden,
-                sequence_id=sequence_id,
-                layers_to_collect=layers_to_collect,
-                output_attentions=False,
-            )
+    with maybe_autocast(device):
+        _last, _pre_norm, collected, _attentions = encoder.transformer(
+            hidden,
+            sequence_id=sequence_id,
+            layers_to_collect=layers_to_collect,
+            output_attentions=False,
+        )
     hidden_states = torch.stack(collected, dim=0).index_select(2, gather_positions)
     return hidden_states.permute(1, 2, 0, 3).contiguous()
 
@@ -947,7 +946,6 @@ def encode_soft_atom_inputs(
         dim=-1,
     )
     c_base = atom_encoder.atom_norm(atom_encoder.atom_linear(atom_feats))
-    c_base = c_base * atom_feature_mask.unsqueeze(-1)
     cos, sin = atom_encoder.atom_transformer._build_3d_rope(ref_pos, ref_space_uid)
     seqlens = atom_index_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(atom_index_mask.flatten(), as_tuple=False).flatten()
