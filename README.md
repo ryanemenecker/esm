@@ -308,6 +308,8 @@ Key options:
 
 The CLI writes three files into `--output-dir`: `run_config.json`, `raw_trajectories.jsonl`, and ranked candidate outputs in both `ranked_candidates.jsonl` and `ranked_candidates.csv`. Each ranked design includes the binder sequence, source trajectories, ipTM, the distogram ipTM proxy, pTM, mean pLDDT, pairwise chain ipTM, and pI.
 
+When `--attn-implementation flash_attention_2` is selected, the standalone single-chain ESMC pseudo-perplexity model keeps that backend, but the ESMC module embedded inside ESMFold2 is automatically downgraded to `sdpa`. Binder design always folds a multi-chain target+binder complex, and the released ESMC flash-attention path does not support chain-aware masking for that case.
+
 For tutorials on how to use ESMFold2, see our [tutorials](https://github.com/Biohub/esm/tree/main/cookbook/tutorials).
 
 

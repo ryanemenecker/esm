@@ -26,6 +26,7 @@ import csv
 import json
 import math
 import random
+import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -778,6 +779,22 @@ def sequence_pI(sequence: str) -> float | None:
         return None
 
 
+def resolve_fold_esmc_attn_implementation(attn_implementation: str, *, warn: bool = True) -> str:
+    # Binder design always folds a target+binder complex, so the ESMC instance
+    # embedded inside ESMFold2 must support chain-aware attention masks.
+    if attn_implementation == "flash_attention_2":
+        if warn:
+            warnings.warn(
+                "ESMFold2 binder design uses multi-chain complexes; overriding the "
+                "ESMFold2-internal ESMC attention backend from 'flash_attention_2' "
+                "to 'sdpa'. The standalone ESMC pseudo-perplexity model keeps the "
+                "requested backend.",
+                stacklevel=2,
+            )
+        return "sdpa"
+    return attn_implementation
+
+
 def load_esmfold2_model(
     *,
     model_id: str,
@@ -798,7 +815,11 @@ def load_esmfold2_model(
     if chunk_size is not None:
         model.set_chunk_size(chunk_size)
 
-    esmc = ESMCModel.from_pretrained(esmc_model_id, attn_implementation=attn_implementation)
+    fold_esmc_attn_implementation = resolve_fold_esmc_attn_implementation(attn_implementation)
+    esmc = ESMCModel.from_pretrained(
+        esmc_model_id,
+        attn_implementation=fold_esmc_attn_implementation,
+    )
     esmc = esmc.to(device=device, dtype=torch.bfloat16).eval()
     for parameter in esmc.parameters():
         parameter.requires_grad_(False)
@@ -1179,6 +1200,10 @@ def build_run_config(args: argparse.Namespace, search_config: SearchConfig, rank
         "esmc_model": args.esmc_model,
         "device": args.device,
         "attn_implementation": args.attn_implementation,
+        "fold_esmc_attn_implementation": resolve_fold_esmc_attn_implementation(
+            args.attn_implementation,
+            warn=False,
+        ),
         "kernel_backend": args.kernel_backend,
         "chunk_size": args.chunk_size,
         "loaded_fold_models": args.loaded_fold_models,
