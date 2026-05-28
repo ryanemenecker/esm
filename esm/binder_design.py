@@ -1279,9 +1279,8 @@ def masked_pseudo_perplexity_loss(
     if mutable_indices.numel() == 0:
         return soft_binder.new_tensor(0.0)
 
-    binder_st = straight_through_onehot(soft_binder)
     base_distribution = soft_binder_to_vocab_distribution(
-        binder_st,
+        soft_binder,
         cls_token_id=tokenizer.cls_token_id,
         eos_token_id=tokenizer.eos_token_id,
         vocab_size=masked_lm_model.config.vocab_size,
@@ -1575,6 +1574,9 @@ def trajectory_search(
                     f"step {step}/{search_config.steps} "
                     f"temp={temperature:.3f} "
                     f"struct={loss_struct.item():.3f} "
+                    f"intra={loss_intra.item():.3f} "
+                    f"inter={loss_inter.item():.3f} "
+                    f"glob={loss_glob.item():.3f} "
                     f"lm={loss_lm.item():.3f} "
                     f"best_ipTM={format_progress_metric(best_iptm_value)}"
                 )
