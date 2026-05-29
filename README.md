@@ -301,9 +301,10 @@ Use `--binder-prompt` instead of `--binder-length` when you need fixed framework
 
 Key options:
 
-- `--binder-type minibinder|antibody` selects the paper defaults for the ESMC prior weight and pI filtering.
+- `--binder-type minibinder|antibody` keeps the paper-exact minibinder path enabled. Antibody mode is intentionally blocked until Chothia CDR restriction is wired in via ANARCI/hmmscan for Algorithm 15.
 - Live progress bars are shown during the search and ranking stages by default, with the search bar updating on every optimization step. Use `--no-progress` to disable them.
 - Final ranking defaults to the paper-style longer folds for minibinders: 3 recycle loops and 200 diffusion steps per candidate.
+- Minibinder selection now follows the paper's ordering directly: candidates with pI above 6.0 are filtered before ranking, and the default final score is `ipTM` rather than an `ipTM`/proxy average.
 - `--proxy-row-indices 25-32,50-56` restricts the Algorithm 15 distogram proxy to a binder residue subset, which is useful for antibody CDR-only scoring.
 - `--disable-search-lm-context` keeps the explicit ESMC regularizer but skips the extra soft ESMC context inside the ESMFold2 search pass when you want a faster, lower-memory search.
 - `--write-top-structures N` writes mmCIF files for the top `N` ranked candidates from the first ranking checkpoint.

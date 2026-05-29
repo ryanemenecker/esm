@@ -135,7 +135,7 @@ class SearchConfig:
 class RankingConfig:
     num_loops: int = 3
     num_sampling_steps: int = 200
-    selection_score: str = "mean"
+    selection_score: str = "iptm"
     write_top_structures: int = 0
 
 
@@ -446,8 +446,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--selection-score",
         choices=("iptm", "proxy", "mean"),
-        default="mean",
-        help="Final selection score computed from the per-model ipTM and Algorithm 15 proxy.",
+        default="iptm",
+        help="Final selection score. The paper ranks by ipTM when available; proxy and mean are optional overrides.",
     )
     parser.add_argument(
         "--proxy-row-indices",
@@ -1346,6 +1346,28 @@ def sequence_pI(sequence: str) -> float | None:
         return None
 
 
+def apply_minibinder_pi_filter(
+    candidates: Sequence[RankedCandidate],
+    *,
+    binder_type: str,
+    pi_threshold: float | None,
+) -> list[RankedCandidate]:
+    filtered: list[RankedCandidate] = []
+    for candidate in candidates:
+        candidate.pI = sequence_pI(candidate.sequence)
+        if binder_type != "minibinder" or pi_threshold is None or pi_threshold < 0:
+            candidate.passed_pi_filter = True
+        else:
+            if candidate.pI is None:
+                raise RuntimeError(
+                    "Exact minibinder ranking requires a computable pI so candidates can be filtered before ranking."
+                )
+            candidate.passed_pi_filter = candidate.pI <= pi_threshold
+        if binder_type != "minibinder" or candidate.passed_pi_filter:
+            filtered.append(candidate)
+    return filtered
+
+
 def distogram_bin_centers(
     num_bins: int,
     *,
@@ -1650,15 +1672,6 @@ def rank_candidates(
     total_candidates = len(candidates)
     total_models = len(ranking_pool.model_ids)
     for candidate_index, candidate in enumerate(candidates, start=1):
-        candidate.pI = sequence_pI(candidate.sequence)
-        threshold = pi_threshold
-        if threshold is None:
-            candidate.passed_pi_filter = True
-        elif threshold < 0:
-            candidate.passed_pi_filter = True
-        else:
-            candidate.passed_pi_filter = candidate.pI is None or candidate.pI <= threshold
-
         per_model_scores: list[dict[str, Any]] = []
         for model_index, model_id in enumerate(ranking_pool.model_ids):
             handle = ranking_pool.get(model_id)
@@ -1719,10 +1732,6 @@ def rank_candidates(
             ranking_config.selection_score,
         )
         ranked.append(candidate)
-
-    filtered = [candidate for candidate in ranked if candidate.passed_pi_filter]
-    if binder_type == "minibinder" and filtered:
-        ranked = filtered
 
     ranked.sort(
         key=lambda candidate: (
@@ -1841,6 +1850,11 @@ def build_run_config(args: argparse.Namespace, search_config: SearchConfig, rank
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.binder_type == "antibody":
+        raise NotImplementedError(
+            "Paper-faithful antibody design requires automatic Chothia CDR selection via ANARCI/hmmscan for Algorithm 15. "
+            "This CLI currently keeps only the paper-exact minibinder path enabled."
+        )
     target_sequence = load_sequence(args)
     binder_prompt = parse_prompt(args.binder_prompt, args.binder_length)
     binder_row_subset = parse_index_subset(args.proxy_row_indices)
@@ -1924,11 +1938,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress.finish(detail=f"completed {len(trajectories)} trajectories")
 
     deduplicated = deduplicate_trajectories(trajectories)
-    ranking_total = len(deduplicated) * len(ranking_pool.model_ids)
+    ranking_candidates = apply_minibinder_pi_filter(
+        deduplicated,
+        binder_type=args.binder_type,
+        pi_threshold=pi_threshold,
+    )
+    ranking_total = len(ranking_candidates) * len(ranking_pool.model_ids)
     if ranking_total > 0:
         progress.start("ranking", ranking_total)
     ranked_candidates = rank_candidates(
-        deduplicated,
+        ranking_candidates,
         target_sequence=target_sequence,
         ranking_pool=ranking_pool,
         ranking_config=ranking_config,
@@ -1939,7 +1958,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress=progress,
     )
     if ranking_total > 0:
-        progress.finish(detail=f"scored {len(deduplicated)} unique candidates")
+        progress.finish(detail=f"scored {len(ranking_candidates)} unique candidates")
     write_outputs(
         args.output_dir,
         config=build_run_config(args, search_config, ranking_config),
