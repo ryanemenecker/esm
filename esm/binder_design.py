@@ -595,16 +595,17 @@ def binder_distribution_to_res_type_soft(soft_binder: torch.Tensor) -> torch.Ten
     return res_type
 
 
-def weighted_scatter_atom_to_token(
+def masked_scatter_atom_to_token_mean(
     atom_features: torch.Tensor,
     atom_to_token: torch.Tensor,
     *,
     n_tokens: int,
-    atom_weight: torch.Tensor,
+    atom_mask: torch.Tensor,
 ) -> torch.Tensor:
     batch_size, atom_count, feature_dim = atom_features.shape
     token_indices = atom_to_token.unsqueeze(-1).expand(batch_size, atom_count, feature_dim)
-    weighted_features = atom_features * atom_weight.unsqueeze(-1)
+    atom_weight = atom_mask.to(dtype=atom_features.dtype)
+    masked_features = atom_features * atom_weight.unsqueeze(-1)
 
     out = torch.zeros(
         batch_size,
@@ -613,7 +614,7 @@ def weighted_scatter_atom_to_token(
         device=atom_features.device,
         dtype=atom_features.dtype,
     )
-    out.scatter_add_(1, token_indices, weighted_features)
+    out.scatter_add_(1, token_indices, masked_features)
 
     denom = torch.zeros(
         batch_size,
@@ -623,7 +624,7 @@ def weighted_scatter_atom_to_token(
         dtype=atom_features.dtype,
     )
     denom.scatter_add_(1, atom_to_token.unsqueeze(-1), atom_weight.unsqueeze(-1))
-    return out / denom.clamp(min=1.0e-6)
+    return out / denom.clamp(min=1.0)
 
 
 def get_protein_atom_template_library() -> ProteinAtomTemplateLibrary:
@@ -957,12 +958,12 @@ def encode_soft_atom_inputs(
         c_l=c_base,
         attention_params=attention_params,
     )
-    q_to_a = F.relu(atom_encoder.atom_to_token_linear(q)) * atom_feature_mask.unsqueeze(-1)
-    return weighted_scatter_atom_to_token(
+    q_to_a = F.relu(atom_encoder.atom_to_token_linear(q))
+    return masked_scatter_atom_to_token_mean(
         q_to_a,
         atom_to_token,
         n_tokens=n_tokens,
-        atom_weight=atom_feature_mask,
+        atom_mask=atom_index_mask,
     )
 
 
@@ -1034,11 +1035,21 @@ def run_soft_search_model(
         a, b = model._discretized_dynamics()
         a = a.view(1, 1, 1, -1).to(device=z.device, dtype=z.dtype)
         b_mat = b.to(device=z.device, dtype=z.dtype)
+        msa_kwargs: dict[str, torch.Tensor] | None = None
+        if model.msa_encoder is not None:
+            msa_attention_mask = tok_mask[:, :, None].float()
+            msa_kwargs = {
+                "x_inputs": x_inputs,
+                "msa_oh": soft_res_type.unsqueeze(2).float(),
+                "has_deletion": torch.zeros_like(msa_attention_mask),
+                "deletion_value": torch.zeros_like(msa_attention_mask),
+                "msa_attention_mask": msa_attention_mask,
+            }
         z = model._run_one_loop(
             z=z,
             z_init=z_init,
             lm_z=lm_z,
-            _msa_kwargs=None,
+            _msa_kwargs=msa_kwargs,
             pair_mask=pair_mask,
             a=a,
             b_mat=b_mat,
@@ -1943,6 +1954,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         binder_type=args.binder_type,
         pi_threshold=pi_threshold,
     )
+    filtered_out = len(deduplicated) - len(ranking_candidates)
     ranking_total = len(ranking_candidates) * len(ranking_pool.model_ids)
     if ranking_total > 0:
         progress.start("ranking", ranking_total)
@@ -1968,6 +1980,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     print(f"Generated {len(trajectories)} trajectories and ranked {min(len(ranked_candidates), args.top_k)} binders.")
+    if args.binder_type == "minibinder" and pi_threshold is not None and pi_threshold >= 0:
+        print(
+            f"Minibinder pI filter kept {len(ranking_candidates)} of {len(deduplicated)} unique candidates "
+            f"(threshold {pi_threshold:.2f}; filtered {filtered_out})."
+        )
     for rank, candidate in enumerate(ranked_candidates[: args.top_k], start=1):
         print(
             f"[{rank}] seq={candidate.sequence} score={candidate.selection_score} "
