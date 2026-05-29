@@ -387,6 +387,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--binder-prompt",
         help="Binder prompt using standard amino acids for fixed positions and # for mutable positions.",
     )
+    parser.add_argument(
+        "--starting-sequence",
+        help="Optional full-length binder sequence used to initialize mutable positions instead of random logits.",
+    )
     parser.add_argument("--binder-length", type=int, help="Binder length when --binder-prompt is not provided.")
     parser.add_argument(
         "--binder-type",
@@ -509,6 +513,27 @@ def parse_prompt(prompt: str | None, binder_length: int | None) -> str:
     return cleaned
 
 
+def parse_starting_sequence(starting_sequence: str | None, binder_prompt: str) -> str | None:
+    if starting_sequence is None:
+        return None
+    cleaned = sanitize_sequence(starting_sequence)
+    if len(cleaned) != len(binder_prompt):
+        raise ValueError("--starting-sequence must have the same length as the binder prompt.")
+
+    for position, (prompt_token, sequence_token) in enumerate(zip(binder_prompt, cleaned), start=1):
+        if prompt_token != "#" and sequence_token != prompt_token:
+            raise ValueError(
+                "--starting-sequence must match fixed binder-prompt residues "
+                f"(position {position}: expected {prompt_token}, got {sequence_token})."
+            )
+        if prompt_token == "#" and sequence_token == "C":
+            raise ValueError(
+                "--starting-sequence cannot place cysteine at mutable positions "
+                f"(position {position}) because mutable cysteines are disabled during search."
+            )
+    return cleaned
+
+
 def parse_index_subset(spec: str | None) -> list[int] | None:
     if spec is None:
         return None
@@ -568,13 +593,23 @@ def temperature_at_step(step_index: int, total_steps: int, temperature_min: floa
     return temperature_min + (1.0 - temperature_min) * 0.5 * (1.0 + math.cos(math.pi * step_index / total_steps))
 
 
-def initialize_binder_logits(prompt: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def initialize_binder_logits(
+    prompt: str,
+    device: torch.device,
+    *,
+    starting_sequence: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits = torch.empty(len(prompt), len(STANDARD_AA_ORDER), device=device, dtype=torch.float32)
     gradient_mask = torch.zeros_like(logits)
     cys_index = AA_TO_STANDARD_INDEX["C"]
     for position, token in enumerate(prompt):
+        start_token = None if starting_sequence is None else starting_sequence[position]
         if token == "#":
-            logits[position].normal_(mean=0.0, std=1.0e-2)
+            if start_token is None:
+                logits[position].normal_(mean=0.0, std=1.0e-2)
+            else:
+                logits[position].zero_()
+                logits[position, AA_TO_STANDARD_INDEX[start_token]] = 10.0
             logits[position, cys_index] = DEFAULT_CYS_LOGIT
             gradient_mask[position] = 1.0
             gradient_mask[position, cys_index] = 0.0
@@ -1515,6 +1550,7 @@ def trajectory_search(
     *,
     target_sequence: str,
     binder_prompt: str,
+    starting_sequence: str | None,
     search_config: SearchConfig,
     search_pool: FoldModelPool,
     lm_model: Any,
@@ -1525,7 +1561,11 @@ def trajectory_search(
     num_trajectories: int | None = None,
 ) -> TrajectoryResult:
     device = search_pool.device
-    logits, gradient_mask = initialize_binder_logits(binder_prompt, device=device)
+    logits, gradient_mask = initialize_binder_logits(
+        binder_prompt,
+        device=device,
+        starting_sequence=starting_sequence,
+    )
     mutable_positions = torch.tensor([token == "#" for token in binder_prompt], device=device)
     prepared = prepare_complex(target_sequence, len(binder_prompt), device)
     best_sequence = binder_distribution_to_sequence(torch.softmax(logits, dim=-1))
@@ -1832,10 +1872,17 @@ def write_outputs(
             )
 
 
-def build_run_config(args: argparse.Namespace, search_config: SearchConfig, ranking_config: RankingConfig) -> dict[str, Any]:
+def build_run_config(
+    args: argparse.Namespace,
+    search_config: SearchConfig,
+    ranking_config: RankingConfig,
+    *,
+    starting_sequence: str | None,
+) -> dict[str, Any]:
     return {
         "target_sequence": args.target_sequence if args.target_sequence else str(args.target_fasta),
         "binder_prompt": args.binder_prompt,
+        "starting_sequence": starting_sequence,
         "binder_length": args.binder_length,
         "binder_type": args.binder_type,
         "search_models": args.search_models,
@@ -1868,6 +1915,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     target_sequence = load_sequence(args)
     binder_prompt = parse_prompt(args.binder_prompt, args.binder_length)
+    starting_sequence = parse_starting_sequence(args.starting_sequence, binder_prompt)
     binder_row_subset = parse_index_subset(args.proxy_row_indices)
     search_models = args.search_models or ["biohub/ESMFold2"]
     ranking_models = args.ranking_models or search_models
@@ -1935,6 +1983,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trajectory_index,
                 target_sequence=target_sequence,
                 binder_prompt=binder_prompt,
+                starting_sequence=starting_sequence,
                 search_config=search_config,
                 search_pool=search_pool,
                 lm_model=lm_model,
@@ -1973,7 +2022,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress.finish(detail=f"scored {len(ranking_candidates)} unique candidates")
     write_outputs(
         args.output_dir,
-        config=build_run_config(args, search_config, ranking_config),
+        config=build_run_config(
+            args,
+            search_config,
+            ranking_config,
+            starting_sequence=starting_sequence,
+        ),
         trajectories=trajectories,
         ranked_candidates=ranked_candidates,
         top_k=args.top_k,
