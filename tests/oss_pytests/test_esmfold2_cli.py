@@ -211,6 +211,14 @@ class _FakeResult:
         self.iptm = iptm
 
 
+def test_format_peak_memory():
+    gib = 1024**3
+    line = fold_cli.format_peak_memory("cuda:2", 3 * gib, 5 * gib)
+    assert "cuda:2" in line
+    assert "3.00 GiB allocated" in line
+    assert "5.00 GiB reserved" in line
+
+
 def test_write_result_single(tmp_path):
     r = _FakeResult("MMCIF-A", 87.5, ptm=0.812, iptm=0.5)
     paths = fold_cli._write_result(r, "job1", tmp_path)

@@ -289,6 +289,18 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def format_peak_memory(device, allocated_bytes: int, reserved_bytes: int) -> str:
+    """One-line peak GPU memory summary. ``reserved`` is what the caching
+    allocator held from the driver (closest to nvidia-smi); ``allocated`` is
+    live tensor memory."""
+    gib = 1024**3
+    return (
+        f"Peak GPU memory on {device}: "
+        f"{allocated_bytes / gib:.2f} GiB allocated, "
+        f"{reserved_bytes / gib:.2f} GiB reserved."
+    )
+
+
 def _write_result(result, name: str, out_dir: Path) -> list[Path]:
     """Write one job's result(s) to .cif and return the written paths."""
     results = result if isinstance(result, list) else [result]
@@ -330,6 +342,13 @@ def run(args: argparse.Namespace) -> int:
         cuda_available=torch.cuda.is_available(),
         device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
     )
+    # Track peak GPU memory across the whole run (load + encode + fold). Reset
+    # now so the reported peak reflects everything this process does on `device`.
+    dev = torch.device(device)
+    track_mem = dev.type == "cuda" and torch.cuda.is_available()
+    if track_mem:
+        torch.cuda.reset_peak_memory_stats(dev)
+
     if args.stage_loading:
         if args.no_offload_esmc:
             print("note: --no-offload-esmc is ignored under --stage-loading.")
@@ -378,6 +397,15 @@ def run(args: argparse.Namespace) -> int:
     for job, result in zip(jobs, results):
         print(f"{job.name}:")
         _write_result(result, job.name, out_dir)
+
+    if track_mem:
+        print(
+            format_peak_memory(
+                dev,
+                torch.cuda.max_memory_allocated(dev),
+                torch.cuda.max_memory_reserved(dev),
+            )
+        )
 
     print(f"Done. {len(jobs)} prediction(s) written to {out_dir}/")
     return 0

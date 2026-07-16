@@ -264,7 +264,9 @@ For quick folding jobs without writing Python, the package ships an
 every input with the ESMC backbone, offloads ESMC from the GPU, then folds each
 structure from the cached embeddings — this lowers peak GPU memory with
 identical output. Each prediction is written to a `.cif` file in the output
-directory.
+directory. When run on a GPU, the command prints the **peak GPU memory** used
+(allocated and reserved) at the end — handy for comparing `--chunk-size` and
+`--stage-loading` settings.
 
 There are three input modes:
 
