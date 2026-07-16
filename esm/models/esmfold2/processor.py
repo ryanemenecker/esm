@@ -1,5 +1,8 @@
+import inspect
 import random
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -384,6 +387,62 @@ class ESMFold2InputBuilder:
             input, seed=seed, device=model.device
         )
 
+        output = self._run_model_forward(
+            model,
+            features,
+            num_loops=num_loops,
+            num_sampling_steps=num_sampling_steps,
+            num_diffusion_samples=num_diffusion_samples,
+            seed=seed,
+            noise_scale=noise_scale,
+            step_scale=step_scale,
+            max_inference_sigma=max_inference_sigma,
+            lm_mask_pct=lm_mask_pct,
+            early_exit=early_exit,
+            lm_dropout=lm_dropout,
+            msa_max_depth=msa_max_depth,
+            msa_column_mask_rate=msa_column_mask_rate,
+        )
+
+        return self.decode(
+            output,
+            features,
+            chain_infos,
+            num_diffusion_samples=num_diffusion_samples,
+            complex_id=complex_id,
+        )
+
+    def _run_model_forward(
+        self,
+        model: Any,
+        features: dict[str, Any],
+        *,
+        num_loops: int,
+        num_sampling_steps: int,
+        num_diffusion_samples: int,
+        seed: int | None,
+        noise_scale: float | None,
+        step_scale: float | None,
+        max_inference_sigma: float | None,
+        lm_mask_pct: float | None,
+        early_exit: bool,
+        lm_dropout: float | None,
+        msa_max_depth: int | None,
+        msa_column_mask_rate: float,
+        lm_hidden_states: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run one ESMFold2 forward pass under the standard inference contexts.
+
+        Shared by :meth:`fold` (which lets the model run its ESMC backbone
+        inline) and :meth:`fold_batch` (which passes a precomputed
+        ``lm_hidden_states`` so the ESMC backbone is skipped). The RNG-seeding
+        and LM-dropout contexts, and every forward kwarg, are identical across
+        both callers — the only difference is whether ``lm_hidden_states`` is
+        supplied. Because the model recomputes ``lm_z`` deterministically from
+        ``lm_hidden_states`` and the ESMC backbone consumes no RNG, supplying a
+        cached ``lm_hidden_states`` yields bit-identical outputs to the inline
+        path.
+        """
         sampler_kwargs: dict[str, Any] = {}
         if noise_scale is not None:
             sampler_kwargs["noise_scale"] = noise_scale
@@ -393,6 +452,12 @@ class ESMFold2InputBuilder:
             sampler_kwargs["max_inference_sigma"] = max_inference_sigma
         if lm_mask_pct is not None:
             sampler_kwargs["lm_mask_pct"] = lm_mask_pct
+
+        # Only pass lm_hidden_states when precomputed; omitting it entirely (vs.
+        # passing None) keeps fold()'s forward call byte-for-byte unchanged.
+        lm_kwargs: dict[str, Any] = {}
+        if lm_hidden_states is not None:
+            lm_kwargs["lm_hidden_states"] = lm_hidden_states
 
         with torch.no_grad():
             with _seed_context(seed) if seed is not None else nullcontext():
@@ -407,16 +472,292 @@ class ESMFold2InputBuilder:
                         msa_column_mask_rate=msa_column_mask_rate,
                         # A null depth means "use the full MSA" => no subsampling.
                         msa_subsample_at_inference=msa_max_depth is not None,
+                        **lm_kwargs,
                         **sampler_kwargs,
                     )
+        return output
 
-        return self.decode(
-            output,
-            features,
-            chain_infos,
-            num_diffusion_samples=num_diffusion_samples,
-            complex_id=complex_id,
-        )
+    def fold_batch(
+        self,
+        model: Any,
+        inputs: StructurePredictionInput | Sequence[StructurePredictionInput],
+        *,
+        num_loops: int = 20,
+        num_sampling_steps: int = 200,
+        num_diffusion_samples: int = 1,
+        seed: int | Sequence[int | None] | None = None,
+        noise_scale: float | None = None,
+        step_scale: float | None = None,
+        max_inference_sigma: float | None = None,
+        lm_mask_pct: float | None = None,
+        early_exit: bool = False,
+        lm_dropout: float | None = 0.3,
+        msa_max_depth: int | None = 1024,
+        msa_column_mask_rate: float = 0.1,
+        complex_id: str | Sequence[str] = "pred",
+        offload_esmc: bool = True,
+        restore_esmc: bool = False,
+        esmc_precision: str = "bf16",
+    ) -> list[MolecularComplexResult | list[MolecularComplexResult]]:
+        """Fold a batch of inputs while keeping ESMC off the compute device during folding.
+
+        Memory-optimized equivalent of calling :meth:`fold` once per input.
+        The peak GPU footprint is reduced by never holding the ESMC PLM
+        backbone resident while the (memory-heavy) folding trunk and diffusion
+        head run. The flow is:
+
+        1. **Encode** — load ESMC onto the compute device (if not already
+           there), and for every input run only the ESMC backbone to produce
+           its ``lm_hidden_states``. Each encoding is moved to CPU RAM
+           immediately; nothing but the current item's ESMC activations lives
+           on the GPU during this phase.
+        2. **Offload** — move ESMC off the compute device (to CPU RAM), freeing
+           its parameters from the GPU for the duration of folding.
+        3. **Fold** — for each input, move its features + cached
+           ``lm_hidden_states`` back to the compute device and run the folding
+           forward (ESMC skipped, since ``lm_hidden_states`` is supplied), then
+           decode.
+
+        By default ESMC is left on CPU when the batch finishes (no wasted
+        re-upload, and the GPU stays clear for the next batch). If ESMC was not
+        loaded on entry, it is unloaded entirely. See ``restore_esmc`` to move
+        it back onto the compute device instead.
+
+        The result is **bit-for-bit identical** to :meth:`fold` per input
+        (given the same ``seed``): ESMC is a deterministic feature extractor
+        that consumes no RNG, ``prepare_input`` touches only RDKit's RNG (not
+        the torch/NumPy/Python global RNG), and the folding forward is run
+        under the exact same seeding and LM-dropout contexts as :meth:`fold`.
+        Encodings are cached in CPU RAM (not on disk) for speed.
+
+        Parameters
+        ----------
+        model : ESMFold2Model
+            The folding model, already on the target device and in eval mode.
+            Must expose the ESMC hooks used here (``_esmc``,
+            ``_compute_lm_hidden_states``, ``load_esmc``, ``config.esmc_id``)
+            and accept a ``lm_hidden_states`` forward kwarg.
+        inputs : StructurePredictionInput or sequence of them
+            One or more input specifications to fold.
+        seed : int, sequence, or None
+            Per-fold seed. A scalar (or None) applies to every input; a
+            sequence assigns one seed per input and must match ``len(inputs)``.
+        complex_id : str or sequence of str
+            Identifier(s) assigned to the predicted complex(es). A scalar
+            applies to every input; a sequence must match ``len(inputs)``.
+        offload_esmc : bool
+            When True (default), ESMC is moved off the compute device during
+            the folding phase. Set False to keep it resident (no memory
+            benefit; useful for A/B parity checks against :meth:`fold`).
+        restore_esmc : bool
+            When True, ESMC is moved back onto its original device after the
+            batch (restoring the model to its entry state). Default False:
+            ESMC that was already loaded on entry is left on CPU, which keeps
+            the GPU clear for the next batch and avoids a wasted re-upload —
+            note a subsequent inline :meth:`fold` on the same model would then
+            need ESMC moved back (``model._esmc.to(model.device)``), or just
+            call :meth:`fold_batch` again. ESMC that this call *loaded* is
+            always unloaded regardless of this flag.
+        esmc_precision : str
+            Precision used if ESMC has to be loaded here (``"bf16"``,
+            ``"fp32"``, or ``"fp8"``). Ignored when the model already has ESMC
+            loaded, or when the model's ``load_esmc`` takes no precision arg.
+
+        All other parameters match :meth:`fold` and are applied to every input.
+
+        Returns
+        -------
+        list
+            One entry per input, aligned with ``inputs``. Each entry matches
+            what :meth:`fold` returns for that input (a single
+            ``MolecularComplexResult`` when ``num_diffusion_samples == 1``,
+            otherwise a list).
+        """
+        if isinstance(inputs, StructurePredictionInput):
+            inputs = [inputs]
+        else:
+            inputs = list(inputs)
+        n = len(inputs)
+        if n == 0:
+            return []
+
+        seeds = self._broadcast_arg(seed, n, "seed")
+        complex_ids = self._broadcast_arg(complex_id, n, "complex_id")
+
+        if not hasattr(model, "_compute_lm_hidden_states") or not hasattr(
+            model, "load_esmc"
+        ):
+            raise TypeError(
+                "fold_batch requires an ESMFold2 model exposing the ESMC hooks "
+                "(`_compute_lm_hidden_states`, `load_esmc`). Use fold() per input "
+                "for models without a detachable ESMC backbone."
+            )
+
+        # Capture the compute device once, before any offload can change what
+        # `model.device` reports.
+        compute_device = model.device
+
+        # --- Phase 1: load ESMC + encode every input, caching to CPU RAM ---
+        esmc_was_present = getattr(model, "_esmc", None) is not None
+        if not esmc_was_present:
+            # `precision` is only accepted by the standard model's load_esmc;
+            # the experimental variant's signature omits it.
+            load_kwargs: dict[str, Any] = {}
+            if "precision" in inspect.signature(model.load_esmc).parameters:
+                load_kwargs["precision"] = esmc_precision
+            model.load_esmc(model.config.esmc_id, **load_kwargs)
+        esmc_origin_device = next(model._esmc.parameters()).device
+        if esmc_origin_device != compute_device:
+            model._esmc.to(compute_device)
+
+        encodings: list[_CachedEncoding] = []
+        try:
+            for i in range(n):
+                features, chain_infos = self.prepare_input(
+                    inputs[i], seed=seeds[i], device=None
+                )
+                lm_hidden_states = self._encode_lm_hidden_states(
+                    model, features, compute_device
+                )
+                encodings.append(
+                    _CachedEncoding(
+                        features=features,
+                        chain_infos=chain_infos,
+                        lm_hidden_states=lm_hidden_states,
+                        seed=seeds[i],
+                        complex_id=complex_ids[i],
+                    )
+                )
+
+            # --- Phase 2: offload ESMC off the compute device for folding ---
+            # After encoding, ESMC sits on the compute device; move it to CPU to
+            # free that device (e.g. the GPU) for folding. Keyed on the compute
+            # device (not ESMC's origin) so it also fires when a user keeps ESMC
+            # on CPU but folds on GPU. No-op when folding on CPU.
+            if offload_esmc and torch.device(compute_device).type != "cpu":
+                model._esmc.to("cpu")
+                self._empty_cache(compute_device)
+
+            # --- Phase 3: fold each input from its cached encoding ---
+            results: list[MolecularComplexResult | list[MolecularComplexResult]] = []
+            for enc in encodings:
+                features = self._features_to_device(enc.features, compute_device)
+                lm_hidden_states = (
+                    enc.lm_hidden_states.to(compute_device)
+                    if enc.lm_hidden_states is not None
+                    else None
+                )
+                output = self._run_model_forward(
+                    model,
+                    features,
+                    num_loops=num_loops,
+                    num_sampling_steps=num_sampling_steps,
+                    num_diffusion_samples=num_diffusion_samples,
+                    seed=enc.seed,
+                    noise_scale=noise_scale,
+                    step_scale=step_scale,
+                    max_inference_sigma=max_inference_sigma,
+                    lm_mask_pct=lm_mask_pct,
+                    early_exit=early_exit,
+                    lm_dropout=lm_dropout,
+                    msa_max_depth=msa_max_depth,
+                    msa_column_mask_rate=msa_column_mask_rate,
+                    lm_hidden_states=lm_hidden_states,
+                )
+                results.append(
+                    self.decode(
+                        output,
+                        features,
+                        enc.chain_infos,
+                        num_diffusion_samples=num_diffusion_samples,
+                        complex_id=enc.complex_id,
+                    )
+                )
+                del features, lm_hidden_states, output
+                self._empty_cache(compute_device)
+        finally:
+            # ESMC that we loaded here is always unloaded (leaves the model as
+            # found). ESMC that was present on entry is left offloaded by
+            # default — no wasted re-upload, GPU stays clear for the next batch
+            # — unless restore_esmc asks to move it back. Runs even on error.
+            if getattr(model, "_esmc", None) is not None:
+                if not esmc_was_present:
+                    model._esmc = None
+                    self._empty_cache(compute_device)
+                elif restore_esmc:
+                    if next(model._esmc.parameters()).device != esmc_origin_device:
+                        model._esmc.to(esmc_origin_device)
+
+        return results
+
+    def _encode_lm_hidden_states(
+        self,
+        model: Any,
+        features: dict[str, Any],
+        device: torch.device | str,
+    ) -> torch.Tensor | None:
+        """Run only the ESMC backbone for one input, returning its LM hidden states on CPU.
+
+        Delegates to the model's own ``_compute_lm_hidden_states`` so the
+        result is identical to what the inline forward would compute. Returns
+        ``None`` when the input carries no ``input_ids`` (mirrors the model's
+        forward, which then produces no LM signal).
+        """
+        input_ids = features.get("input_ids")
+        if input_ids is None:
+            return None
+
+        def _dev(key: str) -> torch.Tensor:
+            return features[key].to(device)
+
+        with torch.no_grad():
+            lm_hidden_states = model._compute_lm_hidden_states(
+                input_ids.to(device),
+                _dev("asym_id"),
+                _dev("residue_index"),
+                _dev("mol_type"),
+                _dev("token_attention_mask"),
+            )
+        return lm_hidden_states.detach().to("cpu")
+
+    @staticmethod
+    def _features_to_device(
+        features: dict[str, Any], device: torch.device | str
+    ) -> dict[str, Any]:
+        return {
+            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in features.items()
+        }
+
+    @staticmethod
+    def _empty_cache(device: torch.device | str) -> None:
+        dev = torch.device(device)
+        if dev.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _broadcast_arg(value: Any, n: int, name: str) -> list[Any]:
+        # Strings are scalars here (not sequences to spread over the batch).
+        if isinstance(value, Sequence) and not isinstance(value, str):
+            value = list(value)
+            if len(value) != n:
+                raise ValueError(
+                    f"{name} has length {len(value)} but there are {n} inputs; "
+                    "pass a single value or one per input."
+                )
+            return value
+        return [value] * n
+
+
+@dataclass
+class _CachedEncoding:
+    """One input's prepared features + cached ESMC hidden states, held in CPU RAM."""
+
+    features: dict[str, Any]
+    chain_infos: list[ChainInfo]
+    lm_hidden_states: torch.Tensor | None
+    seed: int | None
+    complex_id: str = "pred"
 
 
 __all__ = ["ESMFold2InputBuilder", "clean_esmfold2_input"]

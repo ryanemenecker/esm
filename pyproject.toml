@@ -45,6 +45,10 @@ dependencies = [
   "dna_features_viewer",
   "accelerate",
 ]
+
+[project.scripts]
+esmfold2-fold = "esm.models.esmfold2.fold_cli:main"
+
 # Pytest
 [tool.pytest.ini_options]
 addopts = """

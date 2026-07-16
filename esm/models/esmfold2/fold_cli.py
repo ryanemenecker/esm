@@ -1,0 +1,335 @@
+"""Command-line interface for ESMFold2 structure prediction.
+
+Three input modes (mutually exclusive):
+
+  1. Query vs targets  ``--sequence SEQ --targets targets.fasta``
+     Folds a two-chain complex (SEQ as chain A + each target as chain B) for
+     every sequence in ``targets``, one prediction per target.
+
+  2. Single sequence   ``--sequence SEQ``
+     Folds SEQ on its own.
+
+  3. FASTA             ``--fasta seqs.fasta``
+     Folds every sequence in the FASTA individually, one prediction each.
+
+All predictions are batched through ``ESMFold2InputBuilder.fold_batch``, which
+encodes every sequence with the ESMC backbone, offloads ESMC from the compute
+device, then folds each structure from its cached embedding — lowering peak GPU
+memory with bit-identical output.
+
+Examples::
+
+    # query vs a library of targets
+    esmfold2-fold --sequence MKTAYIAKQR... --targets targets.fasta -o out
+
+    # a single sequence, no L^2 chunking (fastest for short sequences)
+    esmfold2-fold --sequence MKTAYIAKQR... --chunk-size none
+
+    # fold every sequence in a FASTA with a smaller chunk for long inputs
+    esmfold2-fold --fasta proteins.fasta --chunk-size 32 -o out
+
+Equivalent to ``python -m esm.models.esmfold2.fold_cli ...``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# Sentinel meaning "--chunk-size was not supplied" — leave the model's own
+# default (64) untouched. Distinct from the value None, which means the user
+# explicitly asked to DISABLE chunking.
+_CHUNK_UNSET = object()
+
+# Soft advisory bounds for --chunk-size (not hard limits).
+_CHUNK_SMALL_WARN = 8
+
+
+@dataclass
+class Job:
+    """One prediction: an output basename and its chains."""
+
+    name: str
+    chains: list[tuple[str, str]]  # [(chain_id, sequence), ...]
+
+
+def parse_chunk_size(value: str):
+    """argparse type for ``--chunk-size``.
+
+    Accepts a positive integer (the token-axis chunk width for the L^2 trunk
+    ops: triangle multiply / outer-product-mean / pair transition), or one of
+    ``none``/``off``/``disable``/``0`` to disable chunking entirely (faster for
+    short sequences, but higher peak memory and OOM-prone past L~600).
+
+    Returns ``int > 0`` or ``None`` (disable).
+    """
+    s = value.strip().lower()
+    if s in ("none", "off", "disable", "0"):
+        return None
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--chunk-size must be a positive integer or one of "
+            f"none/off/disable/0, got {value!r}"
+        )
+    if n < 1:
+        raise argparse.ArgumentTypeError(
+            f"--chunk-size must be >= 1 (or none/0 to disable), got {n}"
+        )
+    return n
+
+
+def sanitize(header: str) -> str:
+    """Turn a FASTA header into a filesystem-safe basename component."""
+    token = header.strip().split()[0] if header.strip() else ""
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", token).strip("_")
+    return token[:120] or "seq"
+
+
+def clean_sequence(seq: str) -> str:
+    """Uppercase and strip whitespace from a sequence."""
+    return "".join(seq.split()).upper()
+
+
+def _dedupe_names(jobs: list[Job]) -> list[Job]:
+    """Ensure output basenames are unique by suffixing collisions with _1, _2, ..."""
+    seen: dict[str, int] = {}
+    for job in jobs:
+        if job.name in seen:
+            seen[job.name] += 1
+            job.name = f"{job.name}_{seen[job.name]}"
+        else:
+            seen[job.name] = 0
+    return jobs
+
+
+def read_fasta(path: str | Path) -> list[tuple[str, str]]:
+    """Read (header, sequence) pairs from a FASTA file (lazy import of parser)."""
+    from esm.utils.parsing import read_sequences
+
+    entries = [(e.header, clean_sequence(e.sequence)) for e in read_sequences(str(path))]
+    entries = [(h, s) for h, s in entries if s]
+    if not entries:
+        raise ValueError(f"No sequences found in FASTA: {path}")
+    return entries
+
+
+def resolve_jobs(
+    sequence: str | None,
+    targets: str | Path | None,
+    fasta: str | Path | None,
+    query_name: str = "query",
+) -> list[Job]:
+    """Validate the input combination and expand it into a list of Jobs.
+
+    Raises ValueError on an invalid combination of arguments.
+    """
+    if fasta is not None and (sequence is not None or targets is not None):
+        raise ValueError("--fasta cannot be combined with --sequence/--targets.")
+    if targets is not None and sequence is None:
+        raise ValueError("--targets requires --sequence (mode 1: query vs targets).")
+    if sequence is None and fasta is None:
+        raise ValueError("Provide one of: --sequence, --sequence + --targets, or --fasta.")
+
+    qname = sanitize(query_name)
+
+    if sequence is not None and targets is not None:  # mode 1
+        seq = clean_sequence(sequence)
+        jobs = [
+            Job(name=f"{qname}__{sanitize(header)}", chains=[("A", seq), ("B", tseq)])
+            for header, tseq in read_fasta(targets)
+        ]
+    elif sequence is not None:  # mode 2
+        jobs = [Job(name=qname, chains=[("A", clean_sequence(sequence))])]
+    else:  # mode 3
+        assert fasta is not None
+        jobs = [
+            Job(name=sanitize(header), chains=[("A", seq)])
+            for header, seq in read_fasta(fasta)
+        ]
+
+    return _dedupe_names(jobs)
+
+
+def _build_spi(job: Job):
+    """Construct a StructurePredictionInput for a job (lazy import of model types)."""
+    from esm.models.esmfold2 import ProteinInput, StructurePredictionInput
+
+    return StructurePredictionInput(
+        sequences=[ProteinInput(id=cid, sequence=seq) for cid, seq in job.chains]
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="esmfold2-fold",
+        description="Fold protein sequences / complexes with ESMFold2.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Modes:\n"
+            "  --sequence SEQ --targets t.fasta   fold SEQ+target complex per target\n"
+            "  --sequence SEQ                     fold SEQ alone\n"
+            "  --fasta seqs.fasta                 fold each sequence individually"
+        ),
+    )
+    inp = p.add_argument_group("inputs")
+    inp.add_argument("-s", "--sequence", help="Query amino-acid sequence.")
+    inp.add_argument(
+        "-t",
+        "--targets",
+        help="FASTA of target sequences; each is folded as a complex with --sequence.",
+    )
+    inp.add_argument(
+        "-f",
+        "--fasta",
+        help="FASTA of sequences; each is folded individually.",
+    )
+    inp.add_argument(
+        "--query-name",
+        default="query",
+        help="Basename for the query sequence in the output (default: query).",
+    )
+
+    out = p.add_argument_group("output")
+    out.add_argument(
+        "-o",
+        "--output-dir",
+        default="esmfold2_out",
+        help="Directory for the predicted .cif files (default: esmfold2_out).",
+    )
+
+    model = p.add_argument_group("model / compute")
+    model.add_argument(
+        "--model",
+        default="biohub/ESMFold2",
+        help="HF repo id or local path of the ESMFold2 model (default: biohub/ESMFold2).",
+    )
+    model.add_argument(
+        "--device",
+        default=None,
+        help="Torch device (default: cuda if available, else cpu).",
+    )
+    model.add_argument(
+        "--chunk-size",
+        type=parse_chunk_size,
+        default=_CHUNK_UNSET,
+        metavar="N|none",
+        help=(
+            "Token-axis chunk for the L^2 trunk ops. Lower = less peak memory, "
+            "more overhead; 'none' (or 0) disables chunking (fastest for short "
+            "sequences, OOM-prone past L~600). Default: model's own value (64)."
+        ),
+    )
+
+    fold = p.add_argument_group("folding parameters")
+    fold.add_argument("--num-loops", type=int, default=20, help="Trunk refinement loops (default: 20).")
+    fold.add_argument(
+        "--num-sampling-steps", type=int, default=200, help="Diffusion steps (default: 200)."
+    )
+    fold.add_argument(
+        "--num-diffusion-samples",
+        type=int,
+        default=1,
+        help="Parallel structure samples per input (default: 1).",
+    )
+    fold.add_argument("--seed", type=int, default=None, help="Random seed (default: unset).")
+    fold.add_argument(
+        "--no-offload-esmc",
+        action="store_true",
+        help="Keep ESMC resident during folding (disables the memory optimization).",
+    )
+    return p
+
+
+def _write_result(result, name: str, out_dir: Path) -> list[Path]:
+    """Write one job's result(s) to .cif and return the written paths."""
+    results = result if isinstance(result, list) else [result]
+    written: list[Path] = []
+    for i, res in enumerate(results):
+        suffix = "" if len(results) == 1 else f"_sample{i}"
+        path = out_dir / f"{name}{suffix}.cif"
+        path.write_text(res.complex.to_mmcif())
+        written.append(path)
+        mean_plddt = float(res.plddt.mean()) if res.plddt is not None else float("nan")
+        extra = ""
+        if res.ptm is not None:
+            extra += f" pTM={res.ptm:.3f}"
+        if res.iptm is not None:
+            extra += f" ipTM={res.iptm:.3f}"
+        print(f"  wrote {path}  (mean pLDDT={mean_plddt:.1f}{extra})")
+    return written
+
+
+def run(args: argparse.Namespace) -> int:
+    import torch
+
+    from esm.models.esmfold2 import ESMFold2InputBuilder
+    from esm.models.esmfold2.esmfold2_remote_code.modeling_esmfold2 import (
+        ESMFold2Model,
+    )
+
+    for knob in ("num_loops", "num_sampling_steps", "num_diffusion_samples"):
+        if getattr(args, knob) < 1:
+            print(f"error: --{knob.replace('_', '-')} must be >= 1", file=sys.stderr)
+            return 2
+
+    jobs = resolve_jobs(args.sequence, args.targets, args.fasta, args.query_name)
+    print(f"Prepared {len(jobs)} prediction(s).")
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading model {args.model!r} on {device} ...")
+    model = ESMFold2Model.from_pretrained(args.model).to(device).eval()
+
+    if args.chunk_size is not _CHUNK_UNSET:
+        model.set_chunk_size(args.chunk_size)
+        if args.chunk_size is None:
+            print("Chunking disabled (--chunk-size none).")
+        else:
+            if args.chunk_size < _CHUNK_SMALL_WARN:
+                print(
+                    f"note: --chunk-size {args.chunk_size} is small; it minimizes "
+                    "memory but adds per-chunk overhead."
+                )
+            print(f"Set L^2 chunk size to {args.chunk_size}.")
+
+    builder = ESMFold2InputBuilder()
+    inputs = [_build_spi(job) for job in jobs]
+    complex_ids = [job.name for job in jobs]
+
+    results = builder.fold_batch(
+        model,
+        inputs,
+        num_loops=args.num_loops,
+        num_sampling_steps=args.num_sampling_steps,
+        num_diffusion_samples=args.num_diffusion_samples,
+        seed=args.seed,
+        complex_id=complex_ids,
+        offload_esmc=not args.no_offload_esmc,
+    )
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for job, result in zip(jobs, results):
+        print(f"{job.name}:")
+        _write_result(result, job.name, out_dir)
+
+    print(f"Done. {len(jobs)} prediction(s) written to {out_dir}/")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return run(args)
+    except ValueError as e:
+        parser.error(str(e))  # exits 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

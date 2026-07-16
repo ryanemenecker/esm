@@ -255,6 +255,63 @@ with open("1mht_pred.cif", "w") as f:
 
 > **AMD ROCm users:** use ROCm 6.4 with PyTorch 2.9 or newer.
 
+### Running ESMFold2 From the Command Line
+<a name="running-esmfold2-from-the-command-line"></a>
+
+For quick folding jobs without writing Python, the package ships an
+`esmfold2-fold` command (installed with `esm`; equivalently
+`python -m esm.models.esmfold2.fold_cli`). It loads the model once, encodes
+every input with the ESMC backbone, offloads ESMC from the GPU, then folds each
+structure from the cached embeddings — this lowers peak GPU memory with
+identical output. Each prediction is written to a `.cif` file in the output
+directory.
+
+There are three input modes:
+
+```bash
+# 1) Query vs. targets — fold a two-chain complex of your sequence (chain A)
+#    with each sequence in the FASTA (chain B); one prediction per target.
+esmfold2-fold --sequence MKTAYIAKQR... --targets targets.fasta --output-dir out
+
+# 2) Single sequence — fold one sequence on its own.
+esmfold2-fold --sequence MKTAYIAKQR... --output-dir out
+
+# 3) FASTA — fold every sequence in the file individually.
+esmfold2-fold --fasta proteins.fasta --output-dir out
+```
+
+Mode 1 writes `query__<target>.cif` per target (rename the query with
+`--query-name`); mode 3 writes one `<header>.cif` per sequence.
+
+**Controlling peak memory with `--chunk-size`.** The L²-heavy trunk operations
+(triangle multiply, outer-product mean, pair transition) are computed in chunks
+along the token axis. A smaller chunk lowers peak GPU memory at the cost of some
+overhead; disabling chunking is fastest for short sequences but memory-hungry
+(and OOM-prone past ~600 residues). The model default is `64`.
+
+```bash
+esmfold2-fold --fasta proteins.fasta --chunk-size 32      # smaller chunk for long/large inputs
+esmfold2-fold --sequence MKTAYIAKQR... --chunk-size none  # disable chunking (also: off / 0)
+```
+
+`--chunk-size` accepts a positive integer, or `none`/`off`/`0` to disable
+chunking; other values are rejected. When omitted, the model's own default is
+used.
+
+Common options (run `esmfold2-fold --help` for the full list):
+
+| Option | Description |
+| --- | --- |
+| `--sequence`, `-s` | Query amino-acid sequence. |
+| `--targets`, `-t` | FASTA of targets; each folded as a complex with `--sequence`. |
+| `--fasta`, `-f` | FASTA of sequences; each folded individually. |
+| `--output-dir`, `-o` | Directory for the `.cif` outputs (default: `esmfold2_out`). |
+| `--chunk-size` | L² chunk size (positive int, or `none`/`0`); default: model's value (64). |
+| `--num-loops`, `--num-sampling-steps`, `--num-diffusion-samples` | Folding knobs (defaults: 20 / 200 / 1). |
+| `--seed` | Random seed for reproducibility. |
+| `--model`, `--device` | Model repo id / torch device (default: `cuda` if available, else `cpu`). |
+| `--no-offload-esmc` | Keep ESMC resident during folding (disables the memory optimization). |
+
 ### Running ESMFold2 Through the Biohub Platform
 
 Install the `esm` Python package
