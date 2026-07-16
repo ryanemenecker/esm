@@ -298,6 +298,28 @@ esmfold2-fold --sequence MKTAYIAKQR... --chunk-size none  # disable chunking (al
 chunking; other values are rejected. When omitted, the model's own default is
 used.
 
+**Lowest peak memory with `--stage-loading`.** By default the model is loaded
+with ESMC resident and ESMC is only offloaded during the folding phase, so the
+ESMC and folding parameters are briefly co-resident while the model loads and
+encodes. `--stage-loading` instead loads ESMC alone, encodes every sequence
+(caching embeddings in RAM), frees ESMC, and only then loads the folding stack —
+so the two never sit on the GPU at once, removing that co-residency spike. The
+output is identical; the trade-off is one extra host↔device transfer of the
+folding weights.
+
+```bash
+esmfold2-fold --fasta proteins.fasta --stage-loading --gpu 0
+```
+
+**Selecting a GPU.** On a multi-GPU machine, target a specific device with
+`--gpu` (0-indexed) or a full `--device` string (the two are mutually
+exclusive):
+
+```bash
+esmfold2-fold --fasta proteins.fasta --gpu 2        # run on cuda:2
+esmfold2-fold --fasta proteins.fasta --device cpu   # or run on CPU
+```
+
 Common options (run `esmfold2-fold --help` for the full list):
 
 | Option | Description |
@@ -309,8 +331,11 @@ Common options (run `esmfold2-fold --help` for the full list):
 | `--chunk-size` | L² chunk size (positive int, or `none`/`0`); default: model's value (64). |
 | `--num-loops`, `--num-sampling-steps`, `--num-diffusion-samples` | Folding knobs (defaults: 20 / 200 / 1). |
 | `--seed` | Random seed for reproducibility. |
-| `--model`, `--device` | Model repo id / torch device (default: `cuda` if available, else `cpu`). |
-| `--no-offload-esmc` | Keep ESMC resident during folding (disables the memory optimization). |
+| `--gpu` | CUDA GPU index to target, 0-indexed (e.g. `--gpu 2` → `cuda:2`). Mutually exclusive with `--device`. |
+| `--device` | Explicit torch device (e.g. `cuda:1`, `cpu`). Default: `cuda` if available, else `cpu`. |
+| `--model` | Model repo id or local path (default: `biohub/ESMFold2`). |
+| `--stage-loading` | Load ESMC and the folding stack in separate stages so they're never co-resident on the GPU (lowest peak memory; identical output). |
+| `--no-offload-esmc` | Keep ESMC resident during folding (disables the memory optimization). Ignored under `--stage-loading`. |
 
 ### Running ESMFold2 Through the Biohub Platform
 

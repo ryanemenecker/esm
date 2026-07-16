@@ -690,6 +690,182 @@ class ESMFold2InputBuilder:
 
         return results
 
+    def fold_batch_staged(
+        self,
+        model: Any,
+        inputs: StructurePredictionInput | Sequence[StructurePredictionInput],
+        *,
+        device: torch.device | str,
+        esmc_id: str | None = None,
+        esmc_precision: str = "bf16",
+        num_loops: int = 20,
+        num_sampling_steps: int = 200,
+        num_diffusion_samples: int = 1,
+        seed: int | Sequence[int | None] | None = None,
+        noise_scale: float | None = None,
+        step_scale: float | None = None,
+        max_inference_sigma: float | None = None,
+        lm_mask_pct: float | None = None,
+        early_exit: bool = False,
+        lm_dropout: float | None = 0.3,
+        msa_max_depth: int | None = 1024,
+        msa_column_mask_rate: float = 0.1,
+        complex_id: str | Sequence[str] = "pred",
+    ) -> list[MolecularComplexResult | list[MolecularComplexResult]]:
+        """Fold a batch with staged loading so ESMC and the folding stack are never co-resident on ``device``.
+
+        :meth:`fold_batch` offloads a *resident* ESMC only during the folding
+        phase, so the two parameter sets still coexist on ``device`` while the
+        model loads and during encoding. This method instead:
+
+        1. moves the folding stack to CPU and loads **only** ESMC onto
+           ``device``,
+        2. encodes every input to CPU RAM (folding stack stays off ``device``),
+        3. **frees** ESMC from ``device``, then
+        4. moves the folding stack onto ``device`` and folds each input from its
+           cached embedding.
+
+        Peak footprint is therefore
+        ``max(ESMC + encode activations, folding stack + fold activations)`` —
+        the two never overlap, eliminating the load/encode co-residency spike.
+
+        Precondition: ``model`` is a folding model loaded **without** its ESMC
+        backbone (ideally still on CPU), e.g.::
+
+            model = ESMFold2Model.from_pretrained(repo, load_esmc=False)
+            results = builder.fold_batch_staged(model, inputs, device="cuda")
+
+        Any ESMC already attached is dropped and reloaded here, so the two
+        parameter sets never coexist on ``device``. On return the folding stack
+        is on ``device`` and ESMC is unloaded.
+
+        The result is **bit-for-bit identical** to :meth:`fold` / :meth:`fold_batch`
+        for the same ``seed``: the encoding calls the model's own
+        ``_compute_lm_hidden_states`` (a deterministic, RNG-free feature
+        extractor), and the folding forward runs under the exact same seeding and
+        LM-dropout contexts, consuming the cached ``lm_hidden_states``.
+
+        Parameters mirror :meth:`fold_batch`; ``device`` is required (the model
+        typically starts on CPU, so it cannot be inferred), ``esmc_id`` defaults
+        to ``model.config.esmc_id``.
+        """
+        if isinstance(inputs, StructurePredictionInput):
+            inputs = [inputs]
+        else:
+            inputs = list(inputs)
+        n = len(inputs)
+        if n == 0:
+            return []
+
+        seeds = self._broadcast_arg(seed, n, "seed")
+        complex_ids = self._broadcast_arg(complex_id, n, "complex_id")
+
+        if not hasattr(model, "_compute_lm_hidden_states") or not hasattr(
+            model, "load_esmc"
+        ):
+            raise TypeError(
+                "fold_batch_staged requires an ESMFold2 model exposing the ESMC "
+                "hooks (`_compute_lm_hidden_states`, `load_esmc`)."
+            )
+
+        compute_device = torch.device(device)
+        esmc_id = esmc_id or model.config.esmc_id
+
+        load_supports_precision = (
+            "precision" in inspect.signature(model.load_esmc).parameters
+        )
+        # fp8 is unsupported here: load_esmc runs the TransformerEngine fp8
+        # quantization on model.device, which staging forces to CPU while the
+        # folding stack is parked there — TE requires CUDA. Use fold_batch (which
+        # loads ESMC on-GPU) for fp8, or bf16/fp32 here.
+        if load_supports_precision and esmc_precision == "fp8":
+            raise ValueError(
+                "fold_batch_staged does not support esmc_precision='fp8' (fp8 "
+                "quantization must run on-GPU, but staging loads ESMC while the "
+                "folding stack occupies CPU). Use fold_batch for fp8, or "
+                "'bf16'/'fp32' here."
+            )
+
+        # Clean staged start: drop any attached ESMC and force the folding stack
+        # to CPU, so nothing but ESMC will sit on `device` during encoding.
+        model._esmc = None
+        model.to("cpu")
+        self._empty_cache(compute_device)
+
+        encodings: list[_CachedEncoding] = []
+        try:
+            # --- Phase 1: load ESMC (only) onto the compute device + encode. ---
+            # Inside the try so the finally frees ESMC even if load/move raises.
+            load_kwargs: dict[str, Any] = {}
+            if load_supports_precision:
+                load_kwargs["precision"] = esmc_precision
+            model.load_esmc(esmc_id, **load_kwargs)  # lands on model.device (CPU)
+            model._esmc.to(compute_device)  # ESMC -> device; folding stack stays CPU
+
+            for i in range(n):
+                features, chain_infos = self.prepare_input(
+                    inputs[i], seed=seeds[i], device=None
+                )
+                lm_hidden_states = self._encode_lm_hidden_states(
+                    model, features, compute_device
+                )
+                encodings.append(
+                    _CachedEncoding(
+                        features=features,
+                        chain_infos=chain_infos,
+                        lm_hidden_states=lm_hidden_states,
+                        seed=seeds[i],
+                        complex_id=complex_ids[i],
+                    )
+                )
+        finally:
+            # Never strand ESMC on the device (even if encoding raised).
+            model._esmc = None
+            self._empty_cache(compute_device)
+
+        # --- Phase 2: now that ESMC is gone, bring the folding stack on. ---
+        model.to(compute_device)
+
+        # --- Phase 3: fold each input from its cached embedding. ---
+        results: list[MolecularComplexResult | list[MolecularComplexResult]] = []
+        for enc in encodings:
+            features = self._features_to_device(enc.features, compute_device)
+            lm_hidden_states = (
+                enc.lm_hidden_states.to(compute_device)
+                if enc.lm_hidden_states is not None
+                else None
+            )
+            output = self._run_model_forward(
+                model,
+                features,
+                num_loops=num_loops,
+                num_sampling_steps=num_sampling_steps,
+                num_diffusion_samples=num_diffusion_samples,
+                seed=enc.seed,
+                noise_scale=noise_scale,
+                step_scale=step_scale,
+                max_inference_sigma=max_inference_sigma,
+                lm_mask_pct=lm_mask_pct,
+                early_exit=early_exit,
+                lm_dropout=lm_dropout,
+                msa_max_depth=msa_max_depth,
+                msa_column_mask_rate=msa_column_mask_rate,
+                lm_hidden_states=lm_hidden_states,
+            )
+            results.append(
+                self.decode(
+                    output,
+                    features,
+                    enc.chain_infos,
+                    num_diffusion_samples=num_diffusion_samples,
+                    complex_id=enc.complex_id,
+                )
+            )
+            del features, lm_hidden_states, output
+            self._empty_cache(compute_device)
+
+        return results
+
     def _encode_lm_hidden_states(
         self,
         model: Any,

@@ -47,6 +47,34 @@ def test_chunk_size_invalid(val):
         fold_cli.parse_chunk_size(val)
 
 
+# --------------------------- device resolution ---------------------------
+def test_resolve_device_by_gpu_index():
+    assert fold_cli.resolve_device(2, None, cuda_available=True, device_count=4) == "cuda:2"
+    assert fold_cli.resolve_device(0, None, cuda_available=True, device_count=4) == "cuda:0"
+    assert fold_cli.resolve_device(3, None, cuda_available=True, device_count=4) == "cuda:3"
+
+
+def test_resolve_device_explicit_and_defaults():
+    assert fold_cli.resolve_device(None, "cuda:1", cuda_available=True, device_count=4) == "cuda:1"
+    assert fold_cli.resolve_device(None, "cpu", cuda_available=False, device_count=0) == "cpu"
+    assert fold_cli.resolve_device(None, None, cuda_available=True, device_count=4) == "cuda"
+    assert fold_cli.resolve_device(None, None, cuda_available=False, device_count=0) == "cpu"
+
+
+@pytest.mark.parametrize(
+    "gpu,device,cuda,count",
+    [
+        (5, None, True, 4),   # out of range
+        (-1, None, True, 4),  # negative
+        (0, None, False, 0),  # no CUDA
+        (1, "cpu", True, 4),  # conflict
+    ],
+)
+def test_resolve_device_errors(gpu, device, cuda, count):
+    with pytest.raises(ValueError):
+        fold_cli.resolve_device(gpu, device, cuda_available=cuda, device_count=count)
+
+
 # --------------------------- helpers ---------------------------
 def test_sanitize():
     assert fold_cli.sanitize("sp|P12345|NAME_HUMAN some description") == "sp_P12345_NAME_HUMAN"
@@ -139,6 +167,23 @@ def test_parser_rejects_bad_chunk_size():
     parser = fold_cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--sequence", "MK", "--chunk-size", "-4"])
+
+
+def test_parser_stage_loading():
+    parser = fold_cli.build_parser()
+    assert parser.parse_args(["--sequence", "MK"]).stage_loading is False
+    assert parser.parse_args(["--sequence", "MK", "--stage-loading"]).stage_loading is True
+
+
+def test_parser_gpu_and_device():
+    parser = fold_cli.build_parser()
+    args = parser.parse_args(["--sequence", "MK", "--gpu", "2"])
+    assert args.gpu == 2 and args.device is None
+    args = parser.parse_args(["--sequence", "MK", "--device", "cuda:1"])
+    assert args.device == "cuda:1" and args.gpu is None
+    # --gpu and --device are mutually exclusive.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--sequence", "MK", "--gpu", "0", "--device", "cuda:1"])
 
 
 # --------------------------- output writing ---------------------------

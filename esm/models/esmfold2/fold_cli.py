@@ -83,6 +83,32 @@ def parse_chunk_size(value: str):
     return n
 
 
+def resolve_device(gpu, device, *, cuda_available: bool, device_count: int) -> str:
+    """Resolve the torch device from the --gpu / --device flags.
+
+    ``gpu`` is a 0-indexed CUDA device index (or None); ``device`` is an
+    explicit torch device string (or None). At most one may be set. Raises
+    ValueError on a conflict, a negative or out-of-range index, or when --gpu
+    is requested without CUDA. Defaults to ``cuda`` when available, else ``cpu``.
+    """
+    if gpu is not None and device is not None:
+        raise ValueError("Pass only one of --gpu and --device.")
+    if gpu is not None:
+        if gpu < 0:
+            raise ValueError(f"--gpu must be >= 0 (0-indexed), got {gpu}.")
+        if not cuda_available:
+            raise ValueError("--gpu was given but no CUDA device is available.")
+        if gpu >= device_count:
+            raise ValueError(
+                f"--gpu {gpu} is out of range: {device_count} CUDA device(s) "
+                f"visible (valid indices 0..{device_count - 1})."
+            )
+        return f"cuda:{gpu}"
+    if device is not None:
+        return device
+    return "cuda" if cuda_available else "cpu"
+
+
 def sanitize(header: str) -> str:
     """Turn a FASTA header into a filesystem-safe basename component."""
     token = header.strip().split()[0] if header.strip() else ""
@@ -208,10 +234,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="biohub/ESMFold2",
         help="HF repo id or local path of the ESMFold2 model (default: biohub/ESMFold2).",
     )
-    model.add_argument(
+    target = model.add_mutually_exclusive_group()
+    target.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CUDA GPU index to target (0-indexed), e.g. --gpu 2 uses cuda:2. "
+        "Mutually exclusive with --device.",
+    )
+    target.add_argument(
         "--device",
         default=None,
-        help="Torch device (default: cuda if available, else cpu).",
+        help="Explicit torch device, e.g. cuda:1 or cpu (default: cuda if "
+        "available, else cpu). Mutually exclusive with --gpu.",
     )
     model.add_argument(
         "--chunk-size",
@@ -240,7 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
     fold.add_argument(
         "--no-offload-esmc",
         action="store_true",
-        help="Keep ESMC resident during folding (disables the memory optimization).",
+        help="Keep ESMC resident during folding (disables the memory optimization). "
+        "Ignored under --stage-loading.",
+    )
+    fold.add_argument(
+        "--stage-loading",
+        action="store_true",
+        help="Lowest peak memory: load ESMC alone and encode, free it, then load "
+        "the folding stack — the two are never co-resident on the device. Removes "
+        "the load/encode co-residency spike (output is identical).",
     )
     return p
 
@@ -280,9 +324,24 @@ def run(args: argparse.Namespace) -> int:
     jobs = resolve_jobs(args.sequence, args.targets, args.fasta, args.query_name)
     print(f"Prepared {len(jobs)} prediction(s).")
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading model {args.model!r} on {device} ...")
-    model = ESMFold2Model.from_pretrained(args.model).to(device).eval()
+    device = resolve_device(
+        args.gpu,
+        args.device,
+        cuda_available=torch.cuda.is_available(),
+        device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+    )
+    if args.stage_loading:
+        if args.no_offload_esmc:
+            print("note: --no-offload-esmc is ignored under --stage-loading.")
+        print(
+            f"Staged loading: ESMC and the folding stack will not be co-resident "
+            f"on {device}."
+        )
+        print(f"Loading folding model {args.model!r} (ESMC loaded on demand) ...")
+        model = ESMFold2Model.from_pretrained(args.model, load_esmc=False).eval()
+    else:
+        print(f"Loading model {args.model!r} on {device} ...")
+        model = ESMFold2Model.from_pretrained(args.model).to(device).eval()
 
     if args.chunk_size is not _CHUNK_UNSET:
         model.set_chunk_size(args.chunk_size)
@@ -300,16 +359,19 @@ def run(args: argparse.Namespace) -> int:
     inputs = [_build_spi(job) for job in jobs]
     complex_ids = [job.name for job in jobs]
 
-    results = builder.fold_batch(
-        model,
-        inputs,
+    fold_kwargs = dict(
         num_loops=args.num_loops,
         num_sampling_steps=args.num_sampling_steps,
         num_diffusion_samples=args.num_diffusion_samples,
         seed=args.seed,
         complex_id=complex_ids,
-        offload_esmc=not args.no_offload_esmc,
     )
+    if args.stage_loading:
+        results = builder.fold_batch_staged(model, inputs, device=device, **fold_kwargs)
+    else:
+        results = builder.fold_batch(
+            model, inputs, offload_esmc=not args.no_offload_esmc, **fold_kwargs
+        )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

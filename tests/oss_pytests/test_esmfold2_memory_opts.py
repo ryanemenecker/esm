@@ -261,6 +261,16 @@ def test_fold_batch_matches_fold_and_is_deterministic():
     assert inline_cif == batched_cif, "fold_batch coordinates != fold"
     assert inline_ptm == batched_ptm, "fold_batch pTM != fold"
 
+    # Staged loading (ESMC and the folding stack never co-resident): a
+    # folding-only model that reloads ESMC internally must match the inline fold.
+    staged_model = ESMFold2Model.from_pretrained(repo, load_esmc=False).eval()
+    staged_plddt, staged_cif, staged_ptm = outputs(
+        builder.fold_batch_staged(staged_model, [inp], device=device, seed=7, **kw)[0]
+    )
+    assert torch.equal(inline_plddt, staged_plddt), "fold_batch_staged pLDDT != fold"
+    assert inline_cif == staged_cif, "fold_batch_staged coordinates != fold"
+    assert inline_ptm == staged_ptm, "fold_batch_staged pTM != fold"
+
     # Determinism: same seed twice -> identical.
     again_plddt, again_cif, _ = outputs(builder.fold(model, inp, seed=7, **kw))
     assert torch.equal(inline_plddt, again_plddt)
