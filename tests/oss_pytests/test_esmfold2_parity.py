@@ -184,6 +184,14 @@ def test_parse_sweep_sizes():
     assert parity._parse_sweep_sizes("64") == [64]
 
 
+def test_lm_dropout_flag_flows_to_fold_kwargs():
+    args = parity.build_parser().parse_args(["--ab"])
+    assert args.lm_dropout == 0.3  # default matches the model
+    assert parity._fold_kwargs(args)["lm_dropout"] == 0.3
+    args = parity.build_parser().parse_args(["--ab", "--lm-dropout", "0"])
+    assert parity._fold_kwargs(args)["lm_dropout"] == 0.0
+
+
 def test_chunk_sweep_mocked(capsys, monkeypatch):
     calls = []
 

@@ -218,6 +218,7 @@ def _fold_kwargs(args) -> dict:
         num_sampling_steps=args.num_sampling_steps,
         num_diffusion_samples=args.num_diffusion_samples,
         seed=args.seed,
+        lm_dropout=args.lm_dropout,
     )
 
 
@@ -599,6 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-loops", type=int, default=20)
     p.add_argument("--num-sampling-steps", type=int, default=100)
     p.add_argument("--num-diffusion-samples", type=int, default=1)
+    p.add_argument(
+        "--lm-dropout",
+        type=float,
+        default=0.3,
+        help="Per-loop LM dropout (model default 0.3 — an intentional stochastic "
+        "ensemble knob). Set 0 to disable, e.g. to test whether it drives the "
+        "fork+offload variance.",
+    )
     p.add_argument(
         "--no-offload",
         action="store_true",
