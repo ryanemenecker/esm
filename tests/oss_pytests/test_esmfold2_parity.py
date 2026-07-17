@@ -192,6 +192,50 @@ def test_lm_dropout_flag_flows_to_fold_kwargs():
     assert parity._fold_kwargs(args)["lm_dropout"] == 0.0
 
 
+def test_deterministic_flag_noop_when_unset():
+    # Unset -> _maybe_deterministic does nothing (no torch state change, no throw).
+    args = parity.build_parser().parse_args(["--ab"])
+    assert args.deterministic is False
+    parity._maybe_deterministic(args)  # should be a no-op, not raise
+
+
+def test_self_repeat_mocked(capsys, monkeypatch):
+    # --self --repeat N folds N times and reports the pairwise spread.
+    calls = []
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        i = len(calls)
+        calls.append((model_cls, offload))
+        # Distinct coords per fold so pairs are non-zero.
+        return _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0.01 * i, 0, 0], [1, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--self", "--which", "fork", "--repeat", "4"])
+    rc = parity.cmd_self(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert len(calls) == 4  # folded 4 times
+    assert all(c[1] is True for c in calls)  # fork -> offload
+    assert "4 folds, 6 pairs" in out  # C(4,2) = 6
+    assert "RMSD(sup)" in out
+
+
+def test_self_original_no_offload(monkeypatch):
+    calls = []
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        calls.append((model_cls, offload))
+        return _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_original", lambda: "ORIG")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+    args = parity.build_parser().parse_args(["--self", "--which", "original"])
+    parity.cmd_self(args)
+    assert all(c[0] == "ORIG" and c[1] is False for c in calls)  # original -> no offload
+
+
 def test_chunk_sweep_mocked(capsys, monkeypatch):
     calls = []
 
@@ -228,6 +272,39 @@ def test_chunk_sweep_falls_back_when_unchunked_fails(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert rc == 0
     assert "Reference = chunk=64" in out  # fell back from failed 'none' to 64
+
+
+def test_memprobe_cpu_noop():
+    probe = parity._MemProbe("cpu")
+    with probe:
+        pass
+    assert probe.stats() is None  # no CUDA -> no memory stats, no crash
+
+
+def test_matrix_reports_memory(capsys, monkeypatch):
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        d = _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0], [1, 0, 0]]))
+        is_fork = model_cls == "FORK"
+        # fork edits use less memory than the original (for the assertion)
+        d["_mem"] = {
+            "peak_res": 15.0 if is_fork else 20.0,
+            "med_res": 8.0 if is_fork else 10.0,
+            "peak_alloc": 14.0 if is_fork else 19.0,
+            "med_alloc": 7.0 if is_fork else 9.0,
+        }
+        return d
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_import_original", lambda: "ORIG")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+    args = parity.build_parser().parse_args(["--matrix"])
+    parity.cmd_matrix(args)
+    out = capsys.readouterr().out
+    assert "peak / median GPU memory" in out
+    assert "peak 15.00" in out and "peak 20.00" in out  # per-config memory shown
+    assert "MEMORY" in out
+    assert "peak saved" in out and "+5.00 GiB" in out  # orig 20 - fork 15
+    assert "median saved" in out and "+2.00 GiB" in out  # orig 10 - fork 8
 
 
 def test_matrix_handles_failed_config(capsys, monkeypatch):

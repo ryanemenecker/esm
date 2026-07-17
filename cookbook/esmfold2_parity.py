@@ -43,7 +43,10 @@ parity is unaffected either way.
 from __future__ import annotations
 
 import argparse
+import os
+import statistics
 import sys
+import threading
 
 import torch
 
@@ -75,6 +78,56 @@ def _parse_chunk_size(value: str):
 def _parse_sweep_sizes(value: str):
     """Comma-separated chunk sizes -> list of (int|None)."""
     return [_parse_chunk_size(tok) for tok in value.split(",") if tok.strip()]
+
+
+class _MemProbe:
+    """Track peak + median GPU memory (GiB) over a fold. No-op off CUDA."""
+
+    def __init__(self, device, interval_s: float = 0.02) -> None:
+        self.device = torch.device(device)
+        self.on = self.device.type == "cuda" and torch.cuda.is_available()
+        self.interval = interval_s
+        self._alloc: list[int] = []
+        self._res: list[int] = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _sample(self) -> None:
+        self._alloc.append(torch.cuda.memory_allocated(self.device))
+        self._res.append(torch.cuda.memory_reserved(self.device))
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._sample()
+            except Exception:
+                break
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        if self.on:
+            torch.cuda.reset_peak_memory_stats(self.device)
+            self._sample()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self.on and self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+        return False
+
+    def stats(self):
+        if not self.on:
+            return None
+        gib = 1024**3
+        return {
+            "peak_alloc": torch.cuda.max_memory_allocated(self.device) / gib,
+            "peak_res": torch.cuda.max_memory_reserved(self.device) / gib,
+            "med_alloc": (statistics.median(self._alloc) / gib) if self._alloc else 0.0,
+            "med_res": (statistics.median(self._res) / gib) if self._res else 0.0,
+        }
 
 
 def result_to_dump(result) -> dict:
@@ -222,6 +275,19 @@ def _fold_kwargs(args) -> dict:
     )
 
 
+def _maybe_deterministic(args) -> None:
+    """Force deterministic CUDA kernels (diagnostic). Best set as a shell env
+    var (CUBLAS_WORKSPACE_CONFIG=:4096:8) before launch; we also set it here as
+    a fallback. warn_only=True so ops lacking a deterministic impl fall back
+    instead of raising."""
+    if not getattr(args, "deterministic", False):
+        return
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print("Deterministic algorithms enabled (CUBLAS_WORKSPACE_CONFIG=:4096:8). "
+          "For full effect, also export that env var before launching.")
+
+
 def _resolve_device(args) -> str:
     if args.gpu is not None:
         return f"cuda:{args.gpu}"
@@ -245,21 +311,24 @@ def _fold(model_cls, args, offload: bool | None = None, chunk=_CHUNK_UNSET) -> d
     # (leave the model's own default).
     effective_chunk = args.chunk_size if chunk is _CHUNK_UNSET else chunk
     device = _resolve_device(args)
-    model = model_cls.from_pretrained(args.model).to(device).eval()
-    if effective_chunk is not _CHUNK_UNSET:
-        model.set_chunk_size(effective_chunk)
-    builder = ESMFold2InputBuilder()
-    inp = _make_input(args.seq)
     # fold_batch offloads ESMC (low peak, same as normal CLI runs); plain fold()
     # keeps ESMC resident the whole forward (native path, higher peak — can OOM
     # on a memory-tight GPU). Both are bit-identical, so parity is unaffected.
-    if offload:
-        result = builder.fold_batch(
-            model, [inp], offload_esmc=True, **_fold_kwargs(args)
-        )[0]
-    else:
-        result = builder.fold(model, inp, **_fold_kwargs(args))
-    dump = result_to_dump(result)
+    # The probe reset happens before loading so peak covers load + fold.
+    with _MemProbe(device) as probe:
+        model = model_cls.from_pretrained(args.model).to(device).eval()
+        if effective_chunk is not _CHUNK_UNSET:
+            model.set_chunk_size(effective_chunk)
+        builder = ESMFold2InputBuilder()
+        inp = _make_input(args.seq)
+        if offload:
+            result = builder.fold_batch(
+                model, [inp], offload_esmc=True, **_fold_kwargs(args)
+            )[0]
+        else:
+            result = builder.fold(model, inp, **_fold_kwargs(args))
+        dump = result_to_dump(result)
+    dump["_mem"] = probe.stats()
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -360,10 +429,32 @@ def cmd_matrix(args) -> int:
         dumps["fork+offload(2)"] = None
         print(f"    FAILED — {type(e).__name__}")
 
-    print("\nConfigs:")
+    def _mem_str(d):
+        m = d.get("_mem") if d else None
+        if not m:
+            return ""
+        return (f"  peak {m['peak_res']:.2f} / median {m['med_res']:.2f} GiB reserved"
+                f" ({m['peak_alloc']:.2f} / {m['med_alloc']:.2f} alloc)")
+
+    print("\nConfigs (peak / median GPU memory):")
     for label, _which, _off in _MATRIX_SPECS:
-        status = "OK" if dumps.get(label) is not None else f"FAILED — {errs[label]}"
-        print(f"  {label:18s}: {status}")
+        d = dumps.get(label)
+        status = "OK" if d is not None else f"FAILED — {errs[label]}"
+        print(f"  {label:18s}: {status}{_mem_str(d)}")
+
+    # Does the fork's model code save memory beyond what offloading already gives?
+    fo, oo = dumps.get("fork+offload"), dumps.get("orig+offload")
+    if fo and oo and fo.get("_mem") and oo.get("_mem"):
+        mf, mo = fo["_mem"], oo["_mem"]
+        dpeak = mo["peak_res"] - mf["peak_res"]
+        dmed = mo["med_res"] - mf["med_res"]
+        print("\nMEMORY — fork's model edits ON TOP of offloading "
+              "(orig+offload - fork+offload, reserved GiB):")
+        print(f"  peak saved:   {dpeak:+.2f} GiB   (orig {mo['peak_res']:.2f} -> fork {mf['peak_res']:.2f})")
+        print(f"  median saved: {dmed:+.2f} GiB   (orig {mo['med_res']:.2f} -> fork {mf['med_res']:.2f})")
+        print("  NOTE: the edits target L^2 trunk ops that only dominate at large L. "
+              "On a short --seq the saving will look small; rerun with a long sequence "
+              "to see their real benefit.")
 
     print("\nPairwise differences:")
     for gname, pairs in _MATRIX_GROUPS:
@@ -472,24 +563,43 @@ def cmd_self(args) -> int:
     else:
         model_cls, label = _import_fork(), "THIS FORK (esmfold2_remote_code)"
         offload = not args.no_offload
+    import itertools
+    import statistics as _stats
+
+    n = max(2, args.repeat)
     path = "fold_batch, ESMC offloaded" if offload else "fold(), ESMC resident"
-    print(f"Folding the {label} model twice (same seed; {path}) to measure the "
+    print(f"Folding the {label} model {n}x (same seed; {path}) to measure the "
           "run-to-run non-determinism floor ...")
-    d1 = _fold(model_cls, args, offload=offload)
-    d2 = _fold(model_cls, args, offload=offload)
-    identical, diffs = compare_dumps(d1, d2)
-    if identical:
-        print(f"SELF-CONSISTENCY ({args.which}): bit-identical — deterministic here.")
-        print("So any --ab difference would be a real code difference, not noise.")
+    dumps = []
+    for i in range(n):
+        print(f"  fold {i + 1}/{n} ...", flush=True)
+        dumps.append(_fold(model_cls, args, offload=offload))
+
+    rmsds, plddts = [], []
+    for i, j in itertools.combinations(range(n), 2):
+        m = _pair_metrics(dumps[i], dumps[j])
+        if m.get("rmsd_sup") is not None:
+            rmsds.append(m["rmsd_sup"])
+        if "plddt_max" in m:
+            plddts.append(m["plddt_max"])
+
+    if not rmsds:
+        print(f"SELF-CONSISTENCY ({args.which}): no comparable coordinates.")
         return 0
-    print(f"SELF-CONSISTENCY ({args.which}): the SAME model differs run-to-run "
-          "(this is the GPU non-determinism floor):")
-    for d in diffs:
-        print(f"  - {d}")
+    if max(rmsds) == 0.0 and (not plddts or max(plddts) == 0.0):
+        print(f"SELF-CONSISTENCY ({args.which}, {n} folds): bit-identical — "
+              "deterministic here.")
+        return 0
+    print(f"\nSELF-CONSISTENCY ({args.which}, {n} folds, {len(rmsds)} pairs):")
+    print(f"  RMSD(sup) Å: min={min(rmsds):.4f}  median={_stats.median(rmsds):.4f}  "
+          f"max={max(rmsds):.4f}")
+    if plddts:
+        print(f"  pLDDT|Δ| max across pairs: {max(plddts):.2e}")
     print(
-        "\nInterpretation: compare these magnitudes with the --ab differences. If "
-        "they are similar, the fork matches the original up to this inherent "
-        "non-determinism — i.e. our edits are output-preserving."
+        "\nInterpretation: this is the config's own run-to-run spread. Compare it to "
+        "the same config's distance from the reference in --matrix:\n"
+        "  * spread ~= distance-to-reference  -> plain non-determinism (no real offset)\n"
+        "  * spread <<  distance-to-reference -> a SYSTEMATIC offset (a real difference)"
     )
     return 0
 
@@ -609,6 +719,19 @@ def build_parser() -> argparse.ArgumentParser:
         "fork+offload variance.",
     )
     p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic CUDA algorithms (diagnostic): if this collapses "
+        "the fork+offload variance, the cause is non-deterministic GPU kernels.",
+    )
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=2,
+        help="For --self, how many times to fold (default 2). Use e.g. 5 to see "
+        "the spread and tell a systematic offset apart from noise.",
+    )
+    p.add_argument(
         "--no-offload",
         action="store_true",
         help="Fold with plain fold() (ESMC resident the whole forward — higher "
@@ -619,6 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    _maybe_deterministic(args)
     if args.ab:
         return cmd_ab(args)
     if args.matrix:
