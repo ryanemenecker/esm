@@ -21,6 +21,10 @@ Examples::
 
     python cookbook/esmfold2_parity.py --ab --gpu 0
 
+    # non-determinism floor of each model (fold it twice, same seed):
+    python cookbook/esmfold2_parity.py --self --which fork     --gpu 0
+    python cookbook/esmfold2_parity.py --self --which original --gpu 0  # native fold(), no offload
+
     # original checkout:
     python cookbook/esmfold2_parity.py --dump orig.pt --gpu 0
     # this fork:
@@ -47,6 +51,30 @@ import torch
 _DEFAULT_SEQ = (
     "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
 )
+
+# Sentinel: --chunk-size not supplied -> leave the model's own default.
+_CHUNK_UNSET = object()
+
+
+def _parse_chunk_size(value: str):
+    """argparse type: positive int, or none/off/0 -> None (disable chunking)."""
+    s = value.strip().lower()
+    if s in ("none", "off", "0"):
+        return None
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"chunk size must be a positive int or none/0, got {value!r}"
+        )
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"chunk size must be >= 1 or none/0, got {n}")
+    return n
+
+
+def _parse_sweep_sizes(value: str):
+    """Comma-separated chunk sizes -> list of (int|None)."""
+    return [_parse_chunk_size(tok) for tok in value.split(",") if tok.strip()]
 
 
 def result_to_dump(result) -> dict:
@@ -207,23 +235,29 @@ def _make_input(seq: str):
     return StructurePredictionInput(sequences=[ProteinInput(id="A", sequence=seq)])
 
 
-def _fold(model_cls, args) -> dict:
+def _fold(model_cls, args, offload: bool | None = None, chunk=_CHUNK_UNSET) -> dict:
     from esm.models.esmfold2 import ESMFold2InputBuilder
 
+    if offload is None:
+        offload = not args.no_offload
+    # Per-call chunk overrides the global --chunk-size; either may be _CHUNK_UNSET
+    # (leave the model's own default).
+    effective_chunk = args.chunk_size if chunk is _CHUNK_UNSET else chunk
     device = _resolve_device(args)
     model = model_cls.from_pretrained(args.model).to(device).eval()
+    if effective_chunk is not _CHUNK_UNSET:
+        model.set_chunk_size(effective_chunk)
     builder = ESMFold2InputBuilder()
     inp = _make_input(args.seq)
-    # Default to the ESMC-offloading path (fold_batch) so the parity run has the
-    # SAME (low) peak memory as normal CLI runs. Plain fold() keeps ESMC resident
-    # the whole forward — a much higher peak that can OOM on a memory-tight GPU.
-    # fold_batch is bit-identical to fold(), so parity is unaffected.
-    if args.no_offload:
-        result = builder.fold(model, inp, **_fold_kwargs(args))
-    else:
+    # fold_batch offloads ESMC (low peak, same as normal CLI runs); plain fold()
+    # keeps ESMC resident the whole forward (native path, higher peak — can OOM
+    # on a memory-tight GPU). Both are bit-identical, so parity is unaffected.
+    if offload:
         result = builder.fold_batch(
             model, [inp], offload_esmc=True, **_fold_kwargs(args)
         )[0]
+    else:
+        result = builder.fold(model, inp, **_fold_kwargs(args))
     dump = result_to_dump(result)
     del model
     if torch.cuda.is_available():
@@ -256,6 +290,159 @@ def _best_available_model():
         return _import_original(), "original (transformers.models.esmfold2)"
 
 
+def _pair_metrics(a: dict, b: dict) -> dict:
+    """Compact difference metrics between two dumps for the matrix table."""
+    m: dict = {}
+    pa, pb = a.get("plddt"), b.get("plddt")
+    if pa is not None and pb is not None and pa.shape == pb.shape:
+        m["plddt_max"] = float((pa.float() - pb.float()).abs().max())
+    if a.get("ptm") is not None and b.get("ptm") is not None:
+        m["ptm_delta"] = abs(a["ptm"] - b["ptm"])
+    cs = compare_coords(a.get("mmcif") or "", b.get("mmcif") or "")
+    if cs and "rmsd" in cs:
+        m["rmsd"] = cs["rmsd"]
+        m["rmsd_sup"] = cs.get("rmsd_superposed")
+        m["max_dev"] = cs["max_dev"]
+    return m
+
+
+def _fmt_pair(m: dict) -> str:
+    rs = f"{m['rmsd_sup']:.4f}" if m.get("rmsd_sup") is not None else "?"
+    pl = f"{m['plddt_max']:.2e}" if "plddt_max" in m else "?"
+    pt = f"{m['ptm_delta']:.2e}" if "ptm_delta" in m else "?"
+    return f"RMSD(sup)={rs} Å | pLDDT|Δ|={pl} | pTM Δ={pt}"
+
+
+# The 2x2 matrix: (label, which model, offload) + a repeat of the first for the
+# non-determinism floor.
+_MATRIX_SPECS = [
+    ("fork+offload", "fork", True),
+    ("fork+no-offload", "fork", False),
+    ("orig+offload", "original", True),
+    ("orig+no-offload", "original", False),
+]
+_MATRIX_GROUPS = [
+    ("NOISE FLOOR (same config, folded twice)",
+     [("fork+offload", "fork+offload(2)")]),
+    ("OFFLOAD IMPACT (same model code; offload on vs off)",
+     [("fork+offload", "fork+no-offload"), ("orig+offload", "orig+no-offload")]),
+    ("CODE IMPACT (fork vs original; same offload setting)",
+     [("fork+offload", "orig+offload"), ("fork+no-offload", "orig+no-offload")]),
+    ("MIXED (both axes differ — reference only)",
+     [("fork+offload", "orig+no-offload"), ("fork+no-offload", "orig+offload")]),
+]
+
+
+def cmd_matrix(args) -> int:
+    print(f"Matrix parity (seed={args.seed}): folding 4 configs + 1 repeat "
+          "(non-determinism floor). Each fold reloads the model.")
+    dumps: dict = {}
+    errs: dict = {}
+    for label, which, off in _MATRIX_SPECS:
+        print(f"  folding {label} ...", flush=True)
+        model_cls = _import_original() if which == "original" else _import_fork()
+        try:
+            dumps[label] = _fold(model_cls, args, offload=off)
+            errs[label] = None
+            print("    OK")
+        except Exception as e:
+            dumps[label] = None
+            errs[label] = f"{type(e).__name__}: {str(e).splitlines()[0][:140]}"
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"    FAILED — {errs[label]}")
+
+    print("  folding fork+offload again (noise floor) ...", flush=True)
+    try:
+        dumps["fork+offload(2)"] = _fold(_import_fork(), args, offload=True)
+    except Exception as e:
+        dumps["fork+offload(2)"] = None
+        print(f"    FAILED — {type(e).__name__}")
+
+    print("\nConfigs:")
+    for label, _which, _off in _MATRIX_SPECS:
+        status = "OK" if dumps.get(label) is not None else f"FAILED — {errs[label]}"
+        print(f"  {label:18s}: {status}")
+
+    print("\nPairwise differences:")
+    for gname, pairs in _MATRIX_GROUPS:
+        print(f"  {gname}")
+        for a_label, b_label in pairs:
+            a, b = dumps.get(a_label), dumps.get(b_label)
+            if a is None or b is None:
+                missing = [lbl for lbl, d in ((a_label, a), (b_label, b)) if d is None]
+                print(f"    {a_label:16s} vs {b_label:18s}: n/a ({', '.join(missing)} unavailable)")
+            else:
+                print(f"    {a_label:16s} vs {b_label:18s}: {_fmt_pair(_pair_metrics(a, b))}")
+
+    print(
+        "\nInterpretation: judge every contrast against the NOISE FLOOR. If OFFLOAD "
+        "IMPACT and CODE IMPACT are ~the floor, then offloading ESMC and this fork's "
+        "edits are both output-preserving — the differences are the model's own "
+        "run-to-run non-determinism, not systematic effects."
+    )
+    return 0
+
+
+def cmd_chunk_sweep(args) -> int:
+    sizes = _parse_sweep_sizes(args.chunk_sizes)
+    which = args.which
+    model_cls = _import_original() if which == "original" else _import_fork()
+    offload = not args.no_offload
+    names = ["none" if s is None else str(s) for s in sizes]
+    print(f"Chunk-size sweep on the {which} model (offload={offload}, seed={args.seed}): "
+          f"{names}")
+
+    dumps: dict = {}
+    for cs, name in zip(sizes, names):
+        print(f"  folding chunk={name} ...", flush=True)
+        try:
+            dumps[name] = _fold(model_cls, args, offload=offload, chunk=cs)
+            print("    OK")
+        except Exception as e:
+            dumps[name] = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"    FAILED — {type(e).__name__}: {str(e).splitlines()[0][:120]}")
+
+    # Reference = unchunked ("none") — the exact ground truth for the L² ops;
+    # fall back to the first size that succeeded.
+    ref, ref_cs = None, None
+    if dumps.get("none") is not None:
+        ref, ref_cs = "none", None
+    else:
+        for cs, name in zip(sizes, names):
+            if dumps.get(name) is not None:
+                ref, ref_cs = name, cs
+                break
+    if ref is None:
+        print("All chunk sizes failed; nothing to compare.")
+        return 1
+
+    print(f"  folding chunk={ref} again (noise floor) ...", flush=True)
+    try:
+        floor = _fold(model_cls, args, offload=offload, chunk=ref_cs)
+    except Exception:
+        floor = None
+
+    print(f"\nReference = chunk={ref} (unchunked is the exact ground truth for the "
+          "chunked L² ops).")
+    print("Difference from reference  (coord RMSD superposed Å | pLDDT max|Δ| | pTM Δ):")
+    if floor is not None:
+        print(f"  NOISE FLOOR (chunk={ref} vs itself): "
+              f"{_fmt_pair(_pair_metrics(dumps[ref], floor))}")
+    for name in names:
+        if name == ref or dumps.get(name) is None:
+            continue
+        print(f"  chunk={name} vs chunk={ref}: {_fmt_pair(_pair_metrics(dumps[name], dumps[ref]))}")
+
+    print("\nInterpretation: if each chunk size differs from unchunked by ~the noise "
+          "floor, chunking is output-preserving at that size; a systematically "
+          "larger difference means that chunk size perturbs the result (expected "
+          "to be tiny/ULP-scale — this quantifies it).")
+    return 0
+
+
 def cmd_ab(args) -> int:
     print("Folding with the ORIGINAL model code (transformers.models.esmfold2) ...")
     d_orig = _fold(_import_original(), args)
@@ -272,20 +459,29 @@ def cmd_ab(args) -> int:
 
 
 def cmd_self(args) -> int:
-    # Fold this fork's model twice (same seed, fresh load each time) to measure
+    # Fold the chosen model twice (same seed, fresh load each time) to measure
     # the GPU run-to-run non-determinism floor. Model kernels like scatter_add
     # use atomics whose accumulation order is not fixed by the seed, so a small
     # nonzero difference here is expected and is the baseline to judge --ab by.
-    print("Folding THIS FORK's model twice (same seed) to measure the "
+    if args.which == "original":
+        model_cls, label = _import_original(), "ORIGINAL (transformers.models.esmfold2)"
+        # Original-vs-original uses the model's NATIVE path: no ESMC offload, so
+        # no fork orchestration is involved in the measurement.
+        offload = False
+    else:
+        model_cls, label = _import_fork(), "THIS FORK (esmfold2_remote_code)"
+        offload = not args.no_offload
+    path = "fold_batch, ESMC offloaded" if offload else "fold(), ESMC resident"
+    print(f"Folding the {label} model twice (same seed; {path}) to measure the "
           "run-to-run non-determinism floor ...")
-    d1 = _fold(_import_fork(), args)
-    d2 = _fold(_import_fork(), args)
+    d1 = _fold(model_cls, args, offload=offload)
+    d2 = _fold(model_cls, args, offload=offload)
     identical, diffs = compare_dumps(d1, d2)
     if identical:
-        print("SELF-CONSISTENCY: bit-identical — the model is deterministic here.")
+        print(f"SELF-CONSISTENCY ({args.which}): bit-identical — deterministic here.")
         print("So any --ab difference would be a real code difference, not noise.")
         return 0
-    print("SELF-CONSISTENCY: the SAME model differs run-to-run "
+    print(f"SELF-CONSISTENCY ({args.which}): the SAME model differs run-to-run "
           "(this is the GPU non-determinism floor):")
     for d in diffs:
         print(f"  - {d}")
@@ -298,7 +494,10 @@ def cmd_self(args) -> int:
 
 
 def cmd_dump(args) -> int:
-    model_cls, which = _best_available_model()
+    if args.which == "original":
+        model_cls, which = _import_original(), "original (transformers.models.esmfold2)"
+    else:
+        model_cls, which = _best_available_model()
     print(f"Folding with {which} and writing artifact to {args.dump} ...")
     dump = _fold(model_cls, args)
     dump["_meta"] = {
@@ -350,12 +549,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--self",
         dest="self_check",
         action="store_true",
-        help="Fold this fork's model twice (same seed) to measure the "
-        "run-to-run non-determinism floor (the baseline for judging --ab).",
+        help="Fold a model twice (same seed) to measure the run-to-run "
+        "non-determinism floor (the baseline for judging --ab). Use --which to "
+        "pick fork (default) or original.",
+    )
+    mode.add_argument(
+        "--matrix",
+        action="store_true",
+        help="Fold all 4 configs (fork/original × offload/no-offload) plus a "
+        "repeat, and print pairwise differences grouped by offload vs code impact.",
+    )
+    mode.add_argument(
+        "--chunk-sweep",
+        dest="chunk_sweep",
+        action="store_true",
+        help="Fold one model (--which) at several --chunk-sizes and compare each "
+        "to the unchunked reference (isolates the chunk-size axis).",
     )
     mode.add_argument("--dump", metavar="PATH", help="Fold once and save a comparable artifact.")
     mode.add_argument("--compare", nargs=2, metavar=("A", "B"), help="Compare two saved artifacts.")
 
+    p.add_argument(
+        "--which",
+        choices=["fork", "original"],
+        default="fork",
+        help="For --self/--dump, which model code to use (default: fork). "
+        "--self --which original folds the original model twice via its native "
+        "fold() path (no ESMC offload).",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=_parse_chunk_size,
+        default=_CHUNK_UNSET,
+        metavar="N|none",
+        help="Set the L² chunk size for ALL folds (ab/self/matrix). "
+        "Default: leave the model's own (64).",
+    )
+    p.add_argument(
+        "--chunk-sizes",
+        default="none,128,64,32",
+        metavar="LIST",
+        help="Comma-separated chunk sizes for --chunk-sweep (default: none,128,64,32).",
+    )
     p.add_argument("--seq", default=_DEFAULT_SEQ, help="Sequence to fold (default: ubiquitin).")
     p.add_argument("--model", default="biohub/ESMFold2", help="Model repo id / path.")
     p.add_argument("--gpu", type=int, default=None, help="CUDA GPU index (0-indexed).")
@@ -377,6 +612,10 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.ab:
         return cmd_ab(args)
+    if args.matrix:
+        return cmd_matrix(args)
+    if args.chunk_sweep:
+        return cmd_chunk_sweep(args)
     if args.self_check:
         return cmd_self(args)
     if args.dump:

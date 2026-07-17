@@ -125,3 +125,117 @@ def test_compare_dumps_reports_coordinate_diff():
     joined = "\n".join(diffs)
     assert "coordinate" in joined.lower()
     assert "max=0.5000" in joined
+
+
+# --------------------------- matrix mode ---------------------------
+def test_pair_metrics_and_format():
+    a = _dump([0.5, 0.9], ptm=0.80, mmcif=_mini_cif([[0, 0, 0], [1, 0, 0]]))
+    b = _dump([0.5, 0.7], ptm=0.79, mmcif=_mini_cif([[0.3, 0, 0], [1, 0, 0]]))
+    m = parity._pair_metrics(a, b)
+    assert abs(m["plddt_max"] - 0.2) < 1e-6
+    assert abs(m["ptm_delta"] - 0.01) < 1e-6
+    assert abs(m["max_dev"] - 0.3) < 1e-4
+    s = parity._fmt_pair(m)
+    assert "RMSD(sup)=" in s and "pLDDT|Δ|=" in s and "pTM Δ=" in s
+
+
+def test_matrix_end_to_end_mocked(capsys, monkeypatch):
+    # Give each (which, offload) config a distinct, deterministic dump so we can
+    # confirm the matrix folds all 4 + the repeat and prints every group.
+    calls = []
+
+    def fake_fold(model_cls, args, offload=None):
+        calls.append((model_cls, offload))
+        # coordinates depend on the config so pairs are non-trivial
+        base = 0.1 * len(calls)
+        return _dump([0.5], ptm=0.7 + base, mmcif=_mini_cif([[base, 0, 0], [1, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_import_original", lambda: "ORIG")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--matrix", "--seed", "0"])
+    rc = parity.cmd_matrix(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    # 4 configs + 1 noise-floor repeat = 5 folds
+    assert len(calls) == 5
+    # offload flags used: fork+off(T), fork+nooff(F), orig+off(T), orig+nooff(F), floor(T)
+    assert [c[1] for c in calls] == [True, False, True, False, True]
+    for group in ("NOISE FLOOR", "OFFLOAD IMPACT", "CODE IMPACT", "MIXED"):
+        assert group in out
+
+
+# --------------------------- chunk-size sweep ---------------------------
+def test_parse_chunk_size():
+    import argparse
+
+    assert parity._parse_chunk_size("64") == 64
+    assert parity._parse_chunk_size("none") is None
+    assert parity._parse_chunk_size("0") is None
+    with pytest.raises(argparse.ArgumentTypeError):
+        parity._parse_chunk_size("-1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        parity._parse_chunk_size("abc")
+
+
+def test_parse_sweep_sizes():
+    assert parity._parse_sweep_sizes("none,128,64,32") == [None, 128, 64, 32]
+    assert parity._parse_sweep_sizes("64") == [64]
+
+
+def test_chunk_sweep_mocked(capsys, monkeypatch):
+    calls = []
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        calls.append(chunk)
+        base = 0.0 if chunk is None else 0.001 * chunk
+        return _dump([0.5], ptm=0.7, mmcif=_mini_cif([[base, 0, 0], [1, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--chunk-sweep", "--chunk-sizes", "none,64,32"])
+    rc = parity.cmd_chunk_sweep(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    # folds at none, 64, 32, then reference (none) again for the floor
+    assert calls == [None, 64, 32, None]
+    assert "Reference = chunk=none" in out
+    assert "NOISE FLOOR" in out
+    assert "chunk=64 vs chunk=none" in out and "chunk=32 vs chunk=none" in out
+
+
+def test_chunk_sweep_falls_back_when_unchunked_fails(capsys, monkeypatch):
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        if chunk is None:
+            raise RuntimeError("CUDA out of memory")  # unchunked OOMs
+        return _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0.001 * chunk, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--chunk-sweep", "--chunk-sizes", "none,64,32"])
+    rc = parity.cmd_chunk_sweep(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Reference = chunk=64" in out  # fell back from failed 'none' to 64
+
+
+def test_matrix_handles_failed_config(capsys, monkeypatch):
+    # If a config raises (e.g. OOM), the matrix continues and marks pairs n/a.
+    def fake_fold(model_cls, args, offload=None):
+        if model_cls == "ORIG" and offload is False:
+            raise RuntimeError("CUDA out of memory")
+        return _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0]]))
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_import_original", lambda: "ORIG")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--matrix"])
+    rc = parity.cmd_matrix(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "orig+no-offload   : FAILED" in out or "orig+no-offload : FAILED" in out
+    assert "n/a" in out  # contrasts involving the failed config
