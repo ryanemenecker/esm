@@ -29,6 +29,11 @@ Examples::
 
 Compares pLDDT, PAE, pTM, ipTM (bit-exact) and the mmCIF text (exact). Exits 0
 on identical, 1 on any difference.
+
+By default folding uses the ESMC-offloading path (same low peak memory as normal
+CLI runs); pass ``--no-offload`` to use plain ``fold()`` (ESMC resident the whole
+forward — higher peak, can OOM on a memory-tight GPU). Both are bit-identical, so
+parity is unaffected either way.
 """
 
 from __future__ import annotations
@@ -66,6 +71,100 @@ def _cmp_tensor(name: str, a, b, diffs: list[str]) -> None:
             diffs.append(f"{name}: differs (max|Δ|={d:.3e})")
 
 
+def _superposed_rmsd(P, Q) -> float:
+    """RMSD after optimal rigid superposition (Kabsch). Isolates real
+    structural differences from a global translation/rotation of the frame."""
+    import numpy as np
+
+    Pc, Qc = P - P.mean(0), Q - Q.mean(0)
+    U, _, Vt = np.linalg.svd(Qc.T @ Pc)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    Qr = Qc @ R.T
+    return float(np.sqrt(((Pc - Qr) ** 2).sum(1).mean()))
+
+
+def compare_coords(mmcif_a: str, mmcif_b: str):
+    """Per-atom coordinate comparison (Å) between two mmCIF strings.
+
+    Atoms are matched by (chain, residue id, atom name). Returns a stats dict,
+    or None if biotite/parsing is unavailable.
+    """
+    try:
+        import io
+
+        import numpy as np
+        import biotite.structure.io.pdbx as pdbx
+    except Exception:
+        return None
+
+    def _load(s):
+        return pdbx.get_structure(pdbx.CIFFile.read(io.StringIO(s)), model=1)
+
+    def _keymap(arr):
+        cid, rid, anm, coord = arr.chain_id, arr.res_id, arr.atom_name, arr.coord
+        return {
+            (str(cid[i]), int(rid[i]), str(anm[i])): coord[i]
+            for i in range(arr.array_length())
+        }
+
+    try:
+        ma, mb = _keymap(_load(mmcif_a)), _keymap(_load(mmcif_b))
+    except Exception:
+        return None
+
+    common = [k for k in ma if k in mb]
+    stats = {
+        "n_a": len(ma),
+        "n_b": len(mb),
+        "n_common": len(common),
+        "n_only_a": len(ma) - len(common),
+        "n_only_b": len(mb) - len(common),
+    }
+    if not common:
+        return stats
+
+    import numpy as np
+
+    P = np.stack([ma[k] for k in common]).astype(np.float64)
+    Q = np.stack([mb[k] for k in common]).astype(np.float64)
+    dev = np.linalg.norm(P - Q, axis=1)  # per-atom Euclidean deviation (Å)
+    stats.update(
+        max_dev=float(dev.max()),
+        mean_dev=float(dev.mean()),
+        median_dev=float(np.median(dev)),
+        rmsd=float(np.sqrt((dev**2).mean())),
+        frac_gt_0p1=float((dev > 0.1).mean()),
+        frac_gt_1p0=float((dev > 1.0).mean()),
+    )
+    try:
+        stats["rmsd_superposed"] = _superposed_rmsd(P, Q)
+    except Exception:
+        pass
+    return stats
+
+
+def _format_coord_stats(cs) -> str:
+    if cs is None:
+        return "      (install biotite for a coordinate-level diff)"
+    if cs.get("n_common", 0) == 0:
+        return f"      no matching atoms (a={cs['n_a']}, b={cs['n_b']}) — atom sets differ"
+    s = (
+        f"      coordinate Δ over {cs['n_common']} atoms (Å): "
+        f"max={cs['max_dev']:.4f}  mean={cs['mean_dev']:.4f}  "
+        f"median={cs['median_dev']:.4f}  RMSD={cs['rmsd']:.4f}"
+    )
+    if "rmsd_superposed" in cs:
+        s += f"  RMSD(superposed)={cs['rmsd_superposed']:.4f}"
+    s += (
+        f"\n      atoms >0.1 Å: {cs['frac_gt_0p1'] * 100:.2f}%   "
+        f">1.0 Å: {cs['frac_gt_1p0'] * 100:.2f}%"
+    )
+    if cs["n_only_a"] or cs["n_only_b"]:
+        s += f"\n      (unmatched atoms: {cs['n_only_a']} only in A, {cs['n_only_b']} only in B)"
+    return s
+
+
 def compare_dumps(a: dict, b: dict) -> tuple[bool, list[str]]:
     """Return (identical, list-of-difference-descriptions)."""
     diffs: list[str] = []
@@ -77,7 +176,9 @@ def compare_dumps(a: dict, b: dict) -> tuple[bool, list[str]]:
     if a.get("mmcif") != b.get("mmcif"):
         la, lb = (a.get("mmcif") or "").splitlines(), (b.get("mmcif") or "").splitlines()
         n_diff = sum(1 for x, y in zip(la, lb) if x != y) + abs(len(la) - len(lb))
-        diffs.append(f"mmcif: differs ({n_diff} line(s) of {max(len(la), len(lb))})")
+        line = f"mmcif: differs ({n_diff} line(s) of {max(len(la), len(lb))})\n"
+        line += _format_coord_stats(compare_coords(a.get("mmcif") or "", b.get("mmcif") or ""))
+        diffs.append(line)
     return (len(diffs) == 0, diffs)
 
 
@@ -110,7 +211,17 @@ def _fold(model_cls, args) -> dict:
     device = _resolve_device(args)
     model = model_cls.from_pretrained(args.model).to(device).eval()
     builder = ESMFold2InputBuilder()
-    result = builder.fold(model, _make_input(args.seq), **_fold_kwargs(args))
+    inp = _make_input(args.seq)
+    # Default to the ESMC-offloading path (fold_batch) so the parity run has the
+    # SAME (low) peak memory as normal CLI runs. Plain fold() keeps ESMC resident
+    # the whole forward — a much higher peak that can OOM on a memory-tight GPU.
+    # fold_batch is bit-identical to fold(), so parity is unaffected.
+    if args.no_offload:
+        result = builder.fold(model, inp, **_fold_kwargs(args))
+    else:
+        result = builder.fold_batch(
+            model, [inp], offload_esmc=True, **_fold_kwargs(args)
+        )[0]
     dump = result_to_dump(result)
     del model
     if torch.cuda.is_available():
@@ -156,6 +267,32 @@ def cmd_ab(args) -> int:
     for d in diffs:
         print(f"  - {d}")
     return 1
+
+
+def cmd_self(args) -> int:
+    # Fold this fork's model twice (same seed, fresh load each time) to measure
+    # the GPU run-to-run non-determinism floor. Model kernels like scatter_add
+    # use atomics whose accumulation order is not fixed by the seed, so a small
+    # nonzero difference here is expected and is the baseline to judge --ab by.
+    print("Folding THIS FORK's model twice (same seed) to measure the "
+          "run-to-run non-determinism floor ...")
+    d1 = _fold(_import_fork(), args)
+    d2 = _fold(_import_fork(), args)
+    identical, diffs = compare_dumps(d1, d2)
+    if identical:
+        print("SELF-CONSISTENCY: bit-identical — the model is deterministic here.")
+        print("So any --ab difference would be a real code difference, not noise.")
+        return 0
+    print("SELF-CONSISTENCY: the SAME model differs run-to-run "
+          "(this is the GPU non-determinism floor):")
+    for d in diffs:
+        print(f"  - {d}")
+    print(
+        "\nInterpretation: compare these magnitudes with the --ab differences. If "
+        "they are similar, the fork matches the original up to this inherent "
+        "non-determinism — i.e. our edits are output-preserving."
+    )
+    return 0
 
 
 def cmd_dump(args) -> int:
@@ -207,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--ab", action="store_true", help="In-process original-vs-fork model comparison.")
+    mode.add_argument(
+        "--self",
+        dest="self_check",
+        action="store_true",
+        help="Fold this fork's model twice (same seed) to measure the "
+        "run-to-run non-determinism floor (the baseline for judging --ab).",
+    )
     mode.add_argument("--dump", metavar="PATH", help="Fold once and save a comparable artifact.")
     mode.add_argument("--compare", nargs=2, metavar=("A", "B"), help="Compare two saved artifacts.")
 
@@ -218,6 +362,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-loops", type=int, default=20)
     p.add_argument("--num-sampling-steps", type=int, default=100)
     p.add_argument("--num-diffusion-samples", type=int, default=1)
+    p.add_argument(
+        "--no-offload",
+        action="store_true",
+        help="Fold with plain fold() (ESMC resident the whole forward — higher "
+        "peak memory). Default offloads ESMC (fold_batch) to match normal runs.",
+    )
     return p
 
 
@@ -225,6 +375,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.ab:
         return cmd_ab(args)
+    if args.self_check:
+        return cmd_self(args)
     if args.dump:
         return cmd_dump(args)
     return cmd_compare(args)

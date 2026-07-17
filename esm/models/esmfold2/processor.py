@@ -42,7 +42,12 @@ def _seed_context(seed: int | None):
         np.random.set_state(np_state)
         torch.random.set_rng_state(torch_state)
         if cuda_state is not None:
-            torch.cuda.set_rng_state_all(cuda_state)
+            try:
+                torch.cuda.set_rng_state_all(cuda_state)
+            except Exception:
+                # If the wrapped block raised a CUDA error, the context may be
+                # unusable; restoring RNG here must not mask the original error.
+                pass
 
 
 @contextmanager
