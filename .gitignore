@@ -3,3 +3,8 @@ esm.egg-info
 .pixi
 *.egg-info
 *.pyc
+
+.DS_Store
+*.DS_Store
+
+CLAUDE.md

@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import argparse
 import re
+import statistics
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -289,16 +291,76 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def format_peak_memory(device, allocated_bytes: int, reserved_bytes: int) -> str:
-    """One-line peak GPU memory summary. ``reserved`` is what the caching
-    allocator held from the driver (closest to nvidia-smi); ``allocated`` is
-    live tensor memory."""
+def format_memory_report(
+    device,
+    peak_allocated: int,
+    peak_reserved: int,
+    median_allocated: int,
+    median_reserved: int,
+    n_samples: int,
+) -> str:
+    """Two-line peak + median GPU memory summary. ``reserved`` is what the
+    caching allocator held from the driver (closest to nvidia-smi); ``allocated``
+    is live tensor memory. The median (sampled over the fold) reflects the
+    steady-state folding usage; the peak captures the worst transient spike."""
     gib = 1024**3
+    plural = "s" if n_samples != 1 else ""
     return (
         f"Peak GPU memory on {device}: "
-        f"{allocated_bytes / gib:.2f} GiB allocated, "
-        f"{reserved_bytes / gib:.2f} GiB reserved."
+        f"{peak_allocated / gib:.2f} GiB allocated, "
+        f"{peak_reserved / gib:.2f} GiB reserved.\n"
+        f"Median GPU memory on {device}: "
+        f"{median_allocated / gib:.2f} GiB allocated, "
+        f"{median_reserved / gib:.2f} GiB reserved "
+        f"(over {n_samples} sample{plural})."
     )
+
+
+class _GpuMemorySampler:
+    """Background thread that samples current GPU memory (allocated + reserved)
+    at a fixed interval, for reporting the median usage across a run.
+
+    Reading the allocator's byte counters from another thread is safe: it
+    queries bookkeeping, launches no kernels, and needs no per-thread context.
+    """
+
+    def __init__(self, device, torch_module, interval_s: float = 0.05) -> None:
+        self._device = device
+        self._torch = torch_module
+        self._interval = interval_s
+        self.allocated: list[int] = []
+        self.reserved: list[int] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample_once(self) -> None:
+        self.allocated.append(self._torch.cuda.memory_allocated(self._device))
+        self.reserved.append(self._torch.cuda.memory_reserved(self._device))
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._sample_once()
+            except Exception:
+                break  # e.g. a CUDA error mid-run; stop sampling quietly
+            self._stop.wait(self._interval)
+
+    def __enter__(self) -> "_GpuMemorySampler":
+        self._sample_once()  # guarantee at least one sample for very fast runs
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        return False
+
+    def medians(self) -> tuple[int, int]:
+        med_a = int(statistics.median(self.allocated)) if self.allocated else 0
+        med_r = int(statistics.median(self.reserved)) if self.reserved else 0
+        return med_a, med_r
 
 
 def _write_result(result, name: str, out_dir: Path) -> list[Path]:
@@ -353,8 +415,10 @@ def run(args: argparse.Namespace) -> int:
         if args.no_offload_esmc:
             print("note: --no-offload-esmc is ignored under --stage-loading.")
         print(
-            f"Staged loading: ESMC and the folding stack will not be co-resident "
-            f"on {device}."
+            f"Staged loading (experimental): ESMC and the folding stack will not "
+            f"be co-resident on {device}. If this errors with a TransformerEngine "
+            f"/ cuBLAS failure, drop --stage-loading — the default path still "
+            f"offloads ESMC during folding."
         )
         print(f"Loading folding model {args.model!r} (ESMC loaded on demand) ...")
         model = ESMFold2Model.from_pretrained(args.model, load_esmc=False).eval()
@@ -385,12 +449,22 @@ def run(args: argparse.Namespace) -> int:
         seed=args.seed,
         complex_id=complex_ids,
     )
-    if args.stage_loading:
-        results = builder.fold_batch_staged(model, inputs, device=device, **fold_kwargs)
-    else:
-        results = builder.fold_batch(
+
+    def _do_fold():
+        if args.stage_loading:
+            return builder.fold_batch_staged(model, inputs, device=device, **fold_kwargs)
+        return builder.fold_batch(
             model, inputs, offload_esmc=not args.no_offload_esmc, **fold_kwargs
         )
+
+    # Sample GPU memory across folding to report the median (steady-state)
+    # alongside the peak.
+    if track_mem:
+        with _GpuMemorySampler(dev, torch) as sampler:
+            results = _do_fold()
+    else:
+        sampler = None
+        results = _do_fold()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -398,12 +472,16 @@ def run(args: argparse.Namespace) -> int:
         print(f"{job.name}:")
         _write_result(result, job.name, out_dir)
 
-    if track_mem:
+    if track_mem and sampler is not None:
+        med_alloc, med_reserved = sampler.medians()
         print(
-            format_peak_memory(
+            format_memory_report(
                 dev,
                 torch.cuda.max_memory_allocated(dev),
                 torch.cuda.max_memory_reserved(dev),
+                med_alloc,
+                med_reserved,
+                len(sampler.allocated),
             )
         )
 

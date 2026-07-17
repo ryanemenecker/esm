@@ -211,12 +211,59 @@ class _FakeResult:
         self.iptm = iptm
 
 
-def test_format_peak_memory():
+def test_format_memory_report():
     gib = 1024**3
-    line = fold_cli.format_peak_memory("cuda:2", 3 * gib, 5 * gib)
-    assert "cuda:2" in line
-    assert "3.00 GiB allocated" in line
-    assert "5.00 GiB reserved" in line
+    r = fold_cli.format_memory_report("cuda:1", 12 * gib, 13 * gib, 8 * gib, 9 * gib, 240)
+    assert "Peak GPU memory on cuda:1: 12.00 GiB allocated, 13.00 GiB reserved." in r
+    assert (
+        "Median GPU memory on cuda:1: 8.00 GiB allocated, 9.00 GiB reserved "
+        "(over 240 samples)." in r
+    )
+
+
+class _FakeCuda:
+    def __init__(self, alloc, reserved):
+        self._alloc, self._reserved, self._i = list(alloc), list(reserved), 0
+
+    def memory_allocated(self, _dev):
+        return self._alloc[min(self._i, len(self._alloc) - 1)]
+
+    def memory_reserved(self, _dev):
+        v = self._reserved[min(self._i, len(self._reserved) - 1)]
+        self._i += 1
+        return v
+
+
+class _FakeTorch:
+    def __init__(self, cuda):
+        self.cuda = cuda
+
+
+def test_memory_sampler_medians():
+    s = fold_cli._GpuMemorySampler("cuda:0", _FakeTorch(_FakeCuda([], [])))
+    s.allocated = [10, 20, 30, 40]
+    s.reserved = [100, 200, 300]
+    assert s.medians() == (25, 200)  # median of the two lists
+
+
+def test_memory_sampler_sample_once():
+    s = fold_cli._GpuMemorySampler(
+        "cuda:0", _FakeTorch(_FakeCuda([5, 7], [50, 70]))
+    )
+    s._sample_once()
+    s._sample_once()
+    assert s.allocated == [5, 7]
+    assert s.reserved == [50, 70]
+
+
+def test_memory_sampler_context_manager():
+    # __enter__ takes >=1 sample and the thread stops cleanly on exit (fake
+    # torch, so no real CUDA is touched).
+    with fold_cli._GpuMemorySampler(
+        "cuda:0", _FakeTorch(_FakeCuda([42], [84])), interval_s=0.01
+    ) as s:
+        pass
+    assert len(s.allocated) >= 1 and s.allocated[0] == 42
 
 
 def test_write_result_single(tmp_path):

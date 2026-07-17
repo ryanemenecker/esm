@@ -909,7 +909,13 @@ class ESMFold2InputBuilder:
     def _empty_cache(device: torch.device | str) -> None:
         dev = torch.device(device)
         if dev.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                # A prior CUDA error can leave the context unusable; a
+                # best-effort cache flush must not mask the original exception
+                # (e.g. surface a TransformerEngine/cuBLAS failure, not this).
+                pass
 
     @staticmethod
     def _broadcast_arg(value: Any, n: int, name: str) -> list[Any]:

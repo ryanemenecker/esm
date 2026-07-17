@@ -313,6 +313,12 @@ folding weights.
 esmfold2-fold --fasta proteins.fasta --stage-loading --gpu 0
 ```
 
+> **Experimental.** `--stage-loading` runs the ESMC backbone while the folding
+> stack sits on CPU. Some TransformerEngine builds do not tolerate this and fail
+> with a cuBLAS error during encoding. If you hit that, drop `--stage-loading`:
+> the default path still offloads ESMC to CPU during the (memory-heavy) folding
+> phase, which the peak-memory print will confirm.
+
 **Selecting a GPU.** On a multi-GPU machine, target a specific device with
 `--gpu` (0-indexed) or a full `--device` string (the two are mutually
 exclusive):
@@ -336,8 +342,21 @@ Common options (run `esmfold2-fold --help` for the full list):
 | `--gpu` | CUDA GPU index to target, 0-indexed (e.g. `--gpu 2` → `cuda:2`). Mutually exclusive with `--device`. |
 | `--device` | Explicit torch device (e.g. `cuda:1`, `cpu`). Default: `cuda` if available, else `cpu`. |
 | `--model` | Model repo id or local path (default: `biohub/ESMFold2`). |
-| `--stage-loading` | Load ESMC and the folding stack in separate stages so they're never co-resident on the GPU (lowest peak memory; identical output). |
+| `--stage-loading` | (Experimental) Load ESMC and the folding stack in separate stages so they're never co-resident on the GPU (lowest peak memory; identical output). May fail on some TransformerEngine builds — see the note above. |
 | `--no-offload-esmc` | Keep ESMC resident during folding (disables the memory optimization). Ignored under `--stage-loading`. |
+
+**Validating output parity.** The memory optimizations are designed to leave
+predictions unchanged. To confirm on your own hardware, `cookbook/esmfold2_parity.py`
+compares this fork's output against the original model code:
+
+```bash
+# in-process: original model code vs this fork (same builder, weights, seed)
+python cookbook/esmfold2_parity.py --ab --gpu 0
+```
+
+It checks pLDDT, PAE, pTM/ipTM (bit-exact) and the mmCIF text, and exits non-zero
+on any difference. For a full-pipeline check against a separate original
+checkout, use `--dump <file>` in each install and then `--compare a b`.
 
 ### Running ESMFold2 Through the Biohub Platform
 
