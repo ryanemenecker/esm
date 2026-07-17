@@ -95,8 +95,8 @@ def compare_coords(mmcif_a: str, mmcif_b: str):
 
         import numpy as np
         import biotite.structure.io.pdbx as pdbx
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": f"biotite unavailable ({e}); `pip install biotite`"}
 
     def _load(s):
         return pdbx.get_structure(pdbx.CIFFile.read(io.StringIO(s)), model=1)
@@ -110,8 +110,8 @@ def compare_coords(mmcif_a: str, mmcif_b: str):
 
     try:
         ma, mb = _keymap(_load(mmcif_a)), _keymap(_load(mmcif_b))
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": f"mmCIF parse failed: {type(e).__name__}: {e}"}
 
     common = [k for k in ma if k in mb]
     stats = {
@@ -146,7 +146,9 @@ def compare_coords(mmcif_a: str, mmcif_b: str):
 
 def _format_coord_stats(cs) -> str:
     if cs is None:
-        return "      (install biotite for a coordinate-level diff)"
+        return "      (no coordinate diff available)"
+    if "error" in cs:
+        return f"      (coordinate diff unavailable — {cs['error']})"
     if cs.get("n_common", 0) == 0:
         return f"      no matching atoms (a={cs['n_a']}, b={cs['n_b']}) — atom sets differ"
     s = (
