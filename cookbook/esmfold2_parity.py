@@ -433,10 +433,12 @@ def cmd_matrix(args) -> int:
         m = d.get("_mem") if d else None
         if not m:
             return ""
-        return (f"  peak {m['peak_res']:.2f} / median {m['med_res']:.2f} GiB reserved"
-                f" ({m['peak_alloc']:.2f} / {m['med_alloc']:.2f} alloc)")
+        # ALLOCATED (live tensors) is the real working-set signal; RESERVED is
+        # CUDA's OS-claimed pool (monotonic — only grows), shown for context.
+        return (f"  alloc {m['peak_alloc']:.2f}/{m['med_alloc']:.2f}"
+                f"  reserved {m['peak_res']:.2f}/{m['med_res']:.2f} GiB (peak/median)")
 
-    print("\nConfigs (peak / median GPU memory):")
+    print("\nConfigs (alloc & reserved, peak/median GPU memory):")
     for label, _which, _off in _MATRIX_SPECS:
         d = dumps.get(label)
         status = "OK" if d is not None else f"FAILED — {errs[label]}"
@@ -446,15 +448,23 @@ def cmd_matrix(args) -> int:
     fo, oo = dumps.get("fork+offload"), dumps.get("orig+offload")
     if fo and oo and fo.get("_mem") and oo.get("_mem"):
         mf, mo = fo["_mem"], oo["_mem"]
-        dpeak = mo["peak_res"] - mf["peak_res"]
-        dmed = mo["med_res"] - mf["med_res"]
         print("\nMEMORY — fork's model edits ON TOP of offloading "
-              "(orig+offload - fork+offload, reserved GiB):")
-        print(f"  peak saved:   {dpeak:+.2f} GiB   (orig {mo['peak_res']:.2f} -> fork {mf['peak_res']:.2f})")
-        print(f"  median saved: {dmed:+.2f} GiB   (orig {mo['med_res']:.2f} -> fork {mf['med_res']:.2f})")
-        print("  NOTE: the edits target L^2 trunk ops that only dominate at large L. "
-              "On a short --seq the saving will look small; rerun with a long sequence "
-              "to see their real benefit.")
+              "(orig+offload - fork+offload; positive = fork uses less):")
+        print("  ALLOCATED (live tensors — the metric that reflects the edits):")
+        print(f"    peak saved:   {mo['peak_alloc'] - mf['peak_alloc']:+.2f} GiB"
+              f"   (orig {mo['peak_alloc']:.2f} -> fork {mf['peak_alloc']:.2f})")
+        print(f"    median saved: {mo['med_alloc'] - mf['med_alloc']:+.2f} GiB"
+              f"   (orig {mo['med_alloc']:.2f} -> fork {mf['med_alloc']:.2f})")
+        print("  RESERVED (CUDA's OS-claimed pool — monotonic, pinned at the ESMC-encode")
+        print("   high-water mark; small deltas here are allocator fragmentation, not real):")
+        print(f"    peak:   {mo['peak_res'] - mf['peak_res']:+.2f} GiB"
+              f"   (orig {mo['peak_res']:.2f} -> fork {mf['peak_res']:.2f})")
+        print(f"    median: {mo['med_res'] - mf['med_res']:+.2f} GiB"
+              f"   (orig {mo['med_res']:.2f} -> fork {mf['med_res']:.2f})")
+        print("  NOTE: the edits shrink the L^2 fold-phase working set — visible in median")
+        print("  ALLOCATED. At short L the PEAK is set by the ESMC encode phase (identical")
+        print("  for both), so peak won't move until L is large enough that the fold trunk")
+        print("  exceeds ESMC. Rerun with a long --seq to see the peak drop too.")
 
     print("\nPairwise differences:")
     for gname, pairs in _MATRIX_GROUPS:

@@ -300,11 +300,15 @@ def test_matrix_reports_memory(capsys, monkeypatch):
     args = parity.build_parser().parse_args(["--matrix"])
     parity.cmd_matrix(args)
     out = capsys.readouterr().out
-    assert "peak / median GPU memory" in out
-    assert "peak 15.00" in out and "peak 20.00" in out  # per-config memory shown
+    assert "peak/median GPU memory" in out
+    # per-config memory shown (alloc & reserved)
+    assert "alloc 14.00/7.00" in out and "reserved 15.00/8.00" in out  # fork
+    assert "alloc 19.00/9.00" in out and "reserved 20.00/10.00" in out  # orig
     assert "MEMORY" in out
-    assert "peak saved" in out and "+5.00 GiB" in out  # orig 20 - fork 15
-    assert "median saved" in out and "+2.00 GiB" in out  # orig 10 - fork 8
+    # headline delta is on ALLOCATED: peak orig 19 - fork 14 = +5; median 9 - 7 = +2
+    assert "ALLOCATED" in out
+    assert "peak saved:   +5.00 GiB" in out
+    assert "median saved: +2.00 GiB" in out
 
 
 def test_matrix_handles_failed_config(capsys, monkeypatch):
