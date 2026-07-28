@@ -350,6 +350,10 @@ def test_matrix_reports_memory(capsys, monkeypatch):
             "peak_alloc": 14.0 if is_fork else 19.0,
             "med_alloc": 7.0 if is_fork else 9.0,
         }
+        # Load phase peaks higher than the fold (ESMC resident before offload)
+        # and is identical for both, so it must not be attributed to the edits.
+        d["_mem_load"] = dict(d["_mem"], peak_alloc=22.0, med_alloc=11.0)
+        d["_time"] = 10.0 if is_fork else 12.0
         return d
 
     monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
@@ -358,15 +362,37 @@ def test_matrix_reports_memory(capsys, monkeypatch):
     args = parity.build_parser().parse_args(["--matrix"])
     parity.cmd_matrix(args)
     out = capsys.readouterr().out
-    assert "peak/median GPU memory" in out
-    # per-config memory shown (alloc & reserved)
-    assert "alloc 14.00/7.00" in out and "reserved 15.00/8.00" in out  # fork
-    assert "alloc 19.00/9.00" in out and "reserved 20.00/10.00" in out  # orig
+    assert "fold-phase alloc peak/median" in out
+    # per-config: fold-phase alloc, then overall peak (max of load and fold)
+    assert "fold alloc  14.00/  7.00" in out and "overall peak  22.00" in out  # fork
+    assert "fold alloc  19.00/  9.00" in out  # orig
     assert "MEMORY" in out
-    # headline delta is on ALLOCATED: peak orig 19 - fork 14 = +5; median 9 - 7 = +2
-    assert "ALLOCATED" in out
+    # headline delta is fold-phase ALLOCATED: peak 19-14=+5; median 9-7=+2
+    assert "FOLD-PHASE ALLOCATED" in out
     assert "peak saved:   +5.00 GiB" in out
     assert "median saved: +2.00 GiB" in out
+    # load phase is reported but explicitly not credited to the edits
+    assert "load-phase peak: orig 22.00 -> fork 22.00" in out
+    assert "fold time: orig 12.0s -> fork 10.0s (1.20x)" in out
+
+
+def test_matrix_memory_survives_missing_load_probe(capsys, monkeypatch):
+    """Dumps from an older run have no _mem_load/_time; must still report."""
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        d = _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0], [1, 0, 0]]))
+        d["_mem"] = {
+            "peak_res": 15.0, "med_res": 8.0, "peak_alloc": 14.0, "med_alloc": 7.0,
+        }
+        return d  # no _mem_load, no _time
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_import_original", lambda: "ORIG")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+    parity.cmd_matrix(parity.build_parser().parse_args(["--matrix"]))
+    out = capsys.readouterr().out
+    assert "overall peak  14.00" in out  # falls back to the fold peak
+    assert "load-phase peak" not in out
 
 
 def test_matrix_handles_failed_config(capsys, monkeypatch):

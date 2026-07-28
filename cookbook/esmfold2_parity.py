@@ -322,15 +322,24 @@ def _fold(model_cls, args, offload: bool | None = None, chunk=_CHUNK_UNSET) -> d
     # keeps ESMC resident the whole forward (native path, higher peak — can OOM
     # on a memory-tight GPU). Both are bit-identical, so parity is unaffected.
     # The probe reset happens before loading so peak covers load + fold.
-    with _MemProbe(device) as probe:
+    # Load and fold are probed SEPARATELY. The median is a time-sampled
+    # statistic, so folding them into one window makes it a measure of how long
+    # `from_pretrained` took (low allocation, slow) rather than of the fold's
+    # working set — the config that loads slowest reports the lowest median.
+    # `_mem` therefore covers the fold only; `_mem_load` keeps the load-phase
+    # peak, which matters because loading puts ESMC on the GPU before offload.
+    with _MemProbe(device) as load_probe:
         model = model_cls.from_pretrained(args.model).to(device).eval()
         if effective_chunk is not _CHUNK_UNSET:
             model.set_chunk_size(effective_chunk)
         builder = ESMFold2InputBuilder()
         inp = _make_input(args.seq)
-        # Time the fold only (not the load) — synchronize so CUDA async launches
-        # are actually accounted for rather than measuring queue time.
         _sync(device)
+    # Normalize the reserved pool so a previous config's cache does not inflate
+    # this one's reserved figures.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    with _MemProbe(device) as probe:
         _t0 = time.perf_counter()
         if offload:
             result = builder.fold_batch(
@@ -342,6 +351,7 @@ def _fold(model_cls, args, offload: bool | None = None, chunk=_CHUNK_UNSET) -> d
         fold_s = time.perf_counter() - _t0
         dump = result_to_dump(result)
     dump["_mem"] = probe.stats()
+    dump["_mem_load"] = load_probe.stats()
     dump["_time"] = fold_s
     del model
     if torch.cuda.is_available():
@@ -447,12 +457,14 @@ def cmd_matrix(args) -> int:
         m = d.get("_mem") if d else None
         if not m:
             return ""
-        # ALLOCATED (live tensors) is the real working-set signal; RESERVED is
-        # CUDA's OS-claimed pool (monotonic — only grows), shown for context.
-        return (f"  alloc {m['peak_alloc']:.2f}/{m['med_alloc']:.2f}"
-                f"  reserved {m['peak_res']:.2f}/{m['med_res']:.2f} GiB (peak/median)")
+        ml = d.get("_mem_load") or {}
+        overall = max(m["peak_alloc"], ml.get("peak_alloc", 0.0))
+        t = d.get("_time")
+        t_str = f"  {t:6.1f}s" if t is not None else ""
+        return (f"  fold alloc {m['peak_alloc']:6.2f}/{m['med_alloc']:6.2f}"
+                f"  overall peak {overall:6.2f} GiB{t_str}")
 
-    print("\nConfigs (alloc & reserved, peak/median GPU memory):")
+    print("\nConfigs (fold-phase alloc peak/median, overall peak incl. load, fold time):")
     for label, _which, _off in _MATRIX_SPECS:
         d = dumps.get(label)
         status = "OK" if d is not None else f"FAILED — {errs[label]}"
@@ -464,21 +476,25 @@ def cmd_matrix(args) -> int:
         mf, mo = fo["_mem"], oo["_mem"]
         print("\nMEMORY — fork's model edits ON TOP of offloading "
               "(orig+offload - fork+offload; positive = fork uses less):")
-        print("  ALLOCATED (live tensors — the metric that reflects the edits):")
+        print("  FOLD-PHASE ALLOCATED — the metric the edits act on. Measured over the")
+        print("  fold only; the model load is probed separately, because a time-sampled")
+        print("  median over load+fold reports load duration, not working set.")
         print(f"    peak saved:   {mo['peak_alloc'] - mf['peak_alloc']:+.2f} GiB"
               f"   (orig {mo['peak_alloc']:.2f} -> fork {mf['peak_alloc']:.2f})")
         print(f"    median saved: {mo['med_alloc'] - mf['med_alloc']:+.2f} GiB"
               f"   (orig {mo['med_alloc']:.2f} -> fork {mf['med_alloc']:.2f})")
-        print("  RESERVED (CUDA's OS-claimed pool — monotonic, pinned at the ESMC-encode")
-        print("   high-water mark; small deltas here are allocator fragmentation, not real):")
-        print(f"    peak:   {mo['peak_res'] - mf['peak_res']:+.2f} GiB"
-              f"   (orig {mo['peak_res']:.2f} -> fork {mf['peak_res']:.2f})")
-        print(f"    median: {mo['med_res'] - mf['med_res']:+.2f} GiB"
-              f"   (orig {mo['med_res']:.2f} -> fork {mf['med_res']:.2f})")
-        print("  NOTE: the edits shrink the L^2 fold-phase working set — visible in median")
-        print("  ALLOCATED. At short L the PEAK is set by the ESMC encode phase (identical")
-        print("  for both), so peak won't move until L is large enough that the fold trunk")
-        print("  exceeds ESMC. Rerun with a long --seq to see the peak drop too.")
+        lf, lo = fo.get("_mem_load") or {}, oo.get("_mem_load") or {}
+        if lf and lo:
+            print(f"    load-phase peak: orig {lo['peak_alloc']:.2f} -> "
+                  f"fork {lf['peak_alloc']:.2f} GiB (weights + ESMC before offload; "
+                  "the edits do not touch this)")
+        tf, to = fo.get("_time"), oo.get("_time")
+        if tf and to:
+            print(f"    fold time: orig {to:.1f}s -> fork {tf:.1f}s ({to / tf:.2f}x)")
+        print("  NOTE: at short L the OVERALL peak is set by the ESMC encode phase, which")
+        print("  is identical for both, so the edits cannot move it. They shrink the L^2")
+        print("  fold working set — rerun with a long --seq for the regime where that")
+        print("  dominates and the peak actually drops.")
 
     print("\nPairwise differences:")
     for gname, pairs in _MATRIX_GROUPS:
