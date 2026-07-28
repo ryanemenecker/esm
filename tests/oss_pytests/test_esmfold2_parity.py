@@ -258,6 +258,64 @@ def test_chunk_sweep_mocked(capsys, monkeypatch):
     assert "chunk=64 vs chunk=none" in out and "chunk=32 vs chunk=none" in out
 
 
+def test_chunk_sweep_reports_time_and_memory(capsys, monkeypatch):
+    """A2: the sweep prices the memory/speed trade per chunk size and names the
+    fastest one relative to the model's default 64."""
+    gib = 1.0
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        d = _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0], [1, 0, 0]]))
+        # bigger chunk -> faster but more memory (the trade being measured)
+        size = 1024 if chunk is None else chunk
+        d["_time"] = 100.0 / size
+        d["_mem"] = {
+            "peak_alloc": 4.0 + size / 512 * gib,
+            "peak_res": 5.0 + size / 512 * gib,
+            "med_alloc": 3.0,
+            "med_res": 4.0,
+        }
+        return d
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(
+        ["--chunk-sweep", "--chunk-sizes", "none,256,64"]
+    )
+    rc = parity.cmd_chunk_sweep(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Cost per chunk size" in out
+    # per-chunk wall clock and peak memory both surfaced
+    assert "chunk=none " in out and "chunk=256 " in out and "chunk=64  " in out
+    assert "GiB alloc" in out and "GiB reserved" in out
+    # unchunked (size 1024) is fastest here; speedup quoted against chunk=64
+    assert "Fastest: chunk=none" in out
+    assert "vs 1.56s for the default chunk=64" in out
+    assert "16.00x speedup" in out
+
+
+def test_chunk_sweep_survives_missing_time_and_memory(capsys, monkeypatch):
+    """A CPU run has no _mem and older dumps have no _time; must not crash."""
+
+    def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
+        d = _dump([0.5], ptm=0.7, mmcif=_mini_cif([[0, 0, 0]]))
+        d["_mem"] = None  # CPU run
+        return d  # and no "_time" key at all
+
+    monkeypatch.setattr(parity, "_import_fork", lambda: "FORK")
+    monkeypatch.setattr(parity, "_fold", fake_fold)
+
+    args = parity.build_parser().parse_args(["--chunk-sweep", "--chunk-sizes", "none,64"])
+    assert parity.cmd_chunk_sweep(args) == 0
+    out = capsys.readouterr().out
+    assert "no GPU memory stats" in out
+
+
+def test_sync_is_noop_on_cpu():
+    parity._sync("cpu")  # must not raise without CUDA
+
+
 def test_chunk_sweep_falls_back_when_unchunked_fails(capsys, monkeypatch):
     def fake_fold(model_cls, args, offload=None, chunk=parity._CHUNK_UNSET):
         if chunk is None:

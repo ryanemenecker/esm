@@ -47,6 +47,7 @@ import os
 import statistics
 import sys
 import threading
+import time
 
 import torch
 
@@ -78,6 +79,12 @@ def _parse_chunk_size(value: str):
 def _parse_sweep_sizes(value: str):
     """Comma-separated chunk sizes -> list of (int|None)."""
     return [_parse_chunk_size(tok) for tok in value.split(",") if tok.strip()]
+
+
+def _sync(device) -> None:
+    """Block until queued CUDA work finishes, so timings aren't just launch time."""
+    if torch.device(device).type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class _MemProbe:
@@ -321,14 +328,21 @@ def _fold(model_cls, args, offload: bool | None = None, chunk=_CHUNK_UNSET) -> d
             model.set_chunk_size(effective_chunk)
         builder = ESMFold2InputBuilder()
         inp = _make_input(args.seq)
+        # Time the fold only (not the load) — synchronize so CUDA async launches
+        # are actually accounted for rather than measuring queue time.
+        _sync(device)
+        _t0 = time.perf_counter()
         if offload:
             result = builder.fold_batch(
                 model, [inp], offload_esmc=True, **_fold_kwargs(args)
             )[0]
         else:
             result = builder.fold(model, inp, **_fold_kwargs(args))
+        _sync(device)
+        fold_s = time.perf_counter() - _t0
         dump = result_to_dump(result)
     dump["_mem"] = probe.stats()
+    dump["_time"] = fold_s
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -527,6 +541,34 @@ def cmd_chunk_sweep(args) -> int:
     except Exception:
         floor = None
 
+    # --- speed / memory table: the point of retuning chunk size upward -------
+    print("\nCost per chunk size (fold wall-clock, peak GPU memory):")
+    best_name, best_s = None, None
+    for name in names:
+        d = dumps.get(name)
+        if d is None:
+            print(f"  chunk={name:5s}: FAILED")
+            continue
+        t = d.get("_time")
+        m = d.get("_mem")
+        t_str = f"{t:7.2f}s" if t is not None else "      ?"
+        if m:
+            mem_str = (f"  peak {m['peak_alloc']:6.2f} GiB alloc"
+                       f" / {m['peak_res']:6.2f} GiB reserved")
+        else:
+            mem_str = "  (no GPU memory stats — CPU run)"
+        print(f"  chunk={name:5s}: {t_str}{mem_str}")
+        if t is not None and (best_s is None or t < best_s):
+            best_name, best_s = name, t
+
+    base = dumps.get("64", {}).get("_time") if dumps.get("64") else None
+    if best_name is not None and base and best_name != "64":
+        print(f"\n  Fastest: chunk={best_name} at {best_s:.2f}s vs {base:.2f}s for the "
+              f"default chunk=64 — {base / best_s:.2f}x speedup "
+              f"({base - best_s:+.2f}s).")
+    elif best_name is not None:
+        print(f"\n  Fastest: chunk={best_name} at {best_s:.2f}s.")
+
     print(f"\nReference = chunk={ref} (unchunked is the exact ground truth for the "
           "chunked L² ops).")
     print("Difference from reference  (coord RMSD superposed Å | pLDDT max|Δ| | pTM Δ):")
@@ -542,6 +584,10 @@ def cmd_chunk_sweep(args) -> int:
           "floor, chunking is output-preserving at that size; a systematically "
           "larger difference means that chunk size perturbs the result (expected "
           "to be tiny/ULP-scale — this quantifies it).")
+    print("Pick the fastest chunk size whose difference is ~the noise floor AND whose "
+          "peak memory still fits your GPU. Larger chunks re-read the right-hand "
+          "stream fewer times, so they trade memory for speed — this table prices "
+          "that trade with your memory savings already banked.")
     return 0
 
 
@@ -708,9 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--chunk-sizes",
-        default="none,128,64,32",
+        default="none,512,256,128,64",
         metavar="LIST",
-        help="Comma-separated chunk sizes for --chunk-sweep (default: none,128,64,32).",
+        help="Comma-separated chunk sizes for --chunk-sweep "
+        "(default: none,512,256,128,64 — sweeps upward from the model's 64 to "
+        "trade banked memory for speed).",
     )
     p.add_argument("--seq", default=_DEFAULT_SEQ, help="Sequence to fold (default: ubiquitin).")
     p.add_argument("--model", default="biohub/ESMFold2", help="Model repo id / path.")

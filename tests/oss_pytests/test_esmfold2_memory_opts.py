@@ -43,6 +43,7 @@ try:
         SwiGLU,
         SwiGLUFFN,
         TriangleMultiplicativeBlock,
+        _autocast_downcasts,
     )
 
     _HAVE_MODULES = True
@@ -275,3 +276,300 @@ def test_fold_batch_matches_fold_and_is_deterministic():
     again_plddt, again_cif, _ = outputs(builder.fold(model, inp, seed=7, **kw))
     assert torch.equal(inline_plddt, again_plddt)
     assert inline_cif == again_cif
+
+
+
+# ===========================================================================
+# A1: triangle-multiply fp32 mask excursion — bit-exactness guards
+# ===========================================================================
+#
+# A1 removes a wasted fp32 round-trip in TriangleMultiplicativeBlock.forward.
+# The 0/1 `visibility` mask arrives in fp32 (trunk/confidence paths) or bool
+# (MSA-encoder path); an fp32 mask type-promoted the block's largest surviving
+# intermediate (`routed`) from bf16 to fp32, after which `.float()` was a no-op
+# and `einsum` cast it straight back down. A1 casts the mask down instead, and
+# skips `.float()` only when `_autocast_downcasts` proves the round-trip is dead.
+#
+# IMPORTANT — why the interesting cases are CUDA-gated: `aten::einsum` is an
+# autocast FALLTHROUGH on CPU (it is only registered for
+# AutocastCUDA/XPU/MPS/MTIA/MAIA). Under CPU autocast the downcast happens only
+# incidentally inside einsum's `sumproduct_pair` decomposition at the internal
+# `bmm`, and an extent-1 contraction (L == 1) short-circuits to `mul` and never
+# downcasts at all. So CPU autocast is NOT a faithful proxy for CUDA autocast
+# here, and `_autocast_downcasts` deliberately returns False on CPU.
+#
+# What the CPU tests therefore pin: (a) the mask downcast alone is bit-exact,
+# (b) the guard refuses to fire on CPU, (c) the fp32 contract is preserved
+# wherever the guard is False. The end-to-end fast-path proof is CUDA-only.
+
+_needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fast path only engages on CUDA autocast"
+)
+
+
+def _trimul_forward_pre_a1(block, pair_grid, visibility):
+    """Byte-for-byte replica of TriangleMultiplicativeBlock.forward before A1."""
+    if visibility is None:
+        visibility = pair_grid.new_ones(pair_grid.shape[:-1])
+    normalized_grid = block.norm_start(pair_grid)
+    bundled = block.proj_bundle(normalized_grid)
+    signal, gate_logits = bundled.split(2 * block.latent_channels, dim=-1)
+    routed = signal * torch.sigmoid(gate_logits)
+    routed = routed * visibility.unsqueeze(-1)  # fp32 mask -> promotes routed
+    left_stream, right_stream = routed.float().chunk(2, dim=-1)  # dead round-trip
+    if block._chunk_size is not None:
+        contracted = block._triangular_contract_chunked(
+            left_stream, right_stream, block._chunk_size
+        )
+    else:
+        contracted = block._triangular_contract(left_stream, right_stream)
+    mixed = block.proj_emit(block.norm_mix(contracted))
+    output_gate = torch.sigmoid(block.proj_gate(normalized_grid))
+    return mixed * output_gate
+
+
+def _trimul_case(flow="outgoing", chunk=None, L=6, seed=0, device="cpu", mask_dtype=torch.float32):
+    torch.manual_seed(seed)
+    block = (
+        TriangleMultiplicativeBlock(input_channels=16, latent_channels=8, flow=flow)
+        .eval()
+        .to(device)
+    )
+    block.set_chunk_size(chunk)
+    pair_grid = torch.randn(1, L, L, 16, device=device)
+    # Mask must stay NON-DEGENERATE at small L: zeroing a fixed-size tail would
+    # blank the whole mask at L<=2 and hide real divergence (this is exactly how
+    # the first version of these tests missed the L==1 counterexample).
+    tok = torch.ones(1, L, device=device)
+    if L > 2:
+        tok[:, -2:] = 0.0
+    visibility = (tok[:, :, None] * tok[:, None, :]).to(mask_dtype)
+    return block, pair_grid, visibility
+
+
+# --------------------------- the guard ---------------------------
+@module_test
+def test_autocast_downcasts_false_without_autocast():
+    assert _autocast_downcasts(torch.randn(2, 2, dtype=torch.bfloat16)) is False
+
+
+@module_test
+def test_autocast_downcasts_false_for_fp32():
+    # fp32 tensor: .float() is already a no-op, nothing to skip.
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert _autocast_downcasts(torch.randn(2, 2)) is False
+
+
+@module_test
+def test_autocast_downcasts_false_on_cpu_even_when_dtype_matches():
+    """Pins the fix for the refuted premise: einsum is an autocast fallthrough on
+    CPU, so the fp32 round-trip is NOT dead there and the guard must not fire."""
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert _autocast_downcasts(torch.randn(2, 2, dtype=torch.bfloat16)) is False
+
+
+@module_test
+def test_cpu_einsum_does_not_downcast_at_extent_one():
+    """Documents WHY cpu is excluded: under CPU bf16 autocast einsum returns
+    bf16 at L>=2 (via its internal bmm) but fp32 at L==1, where the
+    sumproduct_pair decomposition short-circuits to `mul`. If this ever changes,
+    revisit _EINSUM_AUTOCAST_DEVICES rather than deleting this test."""
+    eq = "bikd,bjkd->bijd"
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        big = torch.einsum(eq, torch.randn(1, 3, 3, 4), torch.randn(1, 3, 3, 4))
+        one = torch.einsum(eq, torch.randn(1, 1, 1, 4), torch.randn(1, 1, 1, 4))
+    assert big.dtype == torch.bfloat16
+    assert one.dtype == torch.float32, "extent-1 einsum downcast on CPU after all"
+
+
+@module_test
+@_needs_cuda
+def test_autocast_downcasts_true_on_cuda_when_dtype_matches():
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        t = torch.randn(2, 2, dtype=torch.bfloat16, device="cuda")
+        assert _autocast_downcasts(t) is True
+
+
+@module_test
+@_needs_cuda
+def test_autocast_downcasts_false_on_cuda_dtype_mismatch():
+    # fp16 tensor under a bf16 autocast: einsum would not leave it alone.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        t = torch.randn(2, 2, dtype=torch.float16, device="cuda")
+        assert _autocast_downcasts(t) is False
+
+
+@module_test
+def test_autocast_downcasts_false_for_integer_tensor():
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert _autocast_downcasts(torch.ones(2, 2, dtype=torch.int64)) is False
+
+
+@module_test
+def test_autocast_downcasts_does_not_raise_on_meta():
+    """Unknown/unqueryable device types must fail closed, not raise. A meta
+    forward used to work pre-A1 and must keep working."""
+    assert _autocast_downcasts(torch.randn(2, 2, dtype=torch.bfloat16, device="meta")) is False
+
+
+# --------------------------- bit-exactness (CPU: mask cast only) ---------------------------
+@module_test
+@pytest.mark.parametrize("flow", ["outgoing", "incoming"])
+@pytest.mark.parametrize("chunk", [None, 1, 2, 64])
+@pytest.mark.parametrize("L", [1, 2, 3, 7])
+def test_trimul_a1_bitexact_cpu_autocast(flow, chunk, L):
+    """On CPU the guard is False, so this pins that the mask downcast on its own
+    is bit-exact — including at L==1, the case that refuted the first version."""
+    block, pair_grid, visibility = _trimul_case(flow=flow, chunk=chunk, L=L)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        new = block(pair_grid, visibility)
+        old = _trimul_forward_pre_a1(block, pair_grid, visibility)
+    assert new.dtype == old.dtype
+    assert torch.equal(new, old), (
+        f"A1 changed output (flow={flow}, chunk={chunk}, L={L}); "
+        f"max|delta|={(new.float() - old.float()).abs().max().item():.3e}"
+    )
+
+
+@module_test
+@pytest.mark.parametrize("mask_dtype", [torch.float32, torch.bool, torch.float64])
+def test_trimul_a1_bitexact_across_mask_dtypes(mask_dtype):
+    """fp32 (trunk), bool (MSA encoder) and fp64 masks all hold exactly 0/1, so
+    casting any of them to routed.dtype must be lossless."""
+    block, pair_grid, visibility = _trimul_case(chunk=None, mask_dtype=mask_dtype)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        new = block(pair_grid, visibility)
+        old = _trimul_forward_pre_a1(block, pair_grid, visibility)
+    assert torch.equal(new, old)
+
+
+@module_test
+@pytest.mark.parametrize("chunk", [None, 2])
+def test_trimul_a1_bitexact_without_autocast(chunk):
+    """Off autocast the guard falls back to .float(); output must be unchanged."""
+    block, pair_grid, visibility = _trimul_case(chunk=chunk)
+    new = block(pair_grid, visibility)
+    old = _trimul_forward_pre_a1(block, pair_grid, visibility)
+    assert torch.equal(new, old)
+
+
+@module_test
+def test_trimul_a1_bitexact_visibility_none():
+    """visibility=None takes pair_grid's dtype; the .to() must be a no-op there."""
+    block, pair_grid, _ = _trimul_case(chunk=None)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        new = block(pair_grid, None)
+        old = _trimul_forward_pre_a1(block, pair_grid, None)
+    assert torch.equal(new, old)
+
+
+@module_test
+def test_trimul_a1_fractional_mask_would_not_be_exact():
+    """Pins the load-bearing invariant: the exactness argument holds ONLY for a
+    0/1 mask. If someone introduces a soft mask, A1's premise breaks — this test
+    documents that rather than letting it pass silently."""
+    block, pair_grid, visibility = _trimul_case(chunk=None)
+    soft = visibility * 0.1
+    # 0.1 is not representable in bf16, so casting the mask down loses bits.
+    assert soft.to(torch.bfloat16).to(torch.float32).ne(soft).any(), (
+        "0.1 unexpectedly exact in bf16 — the invariant note needs revisiting"
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        new = block(pair_grid, soft)
+        old = _trimul_forward_pre_a1(block, pair_grid, soft)
+    # The mask cast applies regardless of the guard, so a soft mask diverges even
+    # on CPU. This is the invariant failing loudly, exactly as intended: A1 is
+    # output-preserving ONLY for a 0/1 mask. Every mask in ESMFold2 today is 0/1
+    # (verified across all call sites); if that ever changes, revisit A1.
+    assert not torch.equal(new, old), (
+        "a fractional mask unexpectedly round-tripped exactly — if masks are now "
+        "guaranteed 0/1 by construction this test can go, but do not just delete it"
+    )
+
+
+# --------------------------- CPU: fp32 contract preserved ---------------------------
+def _einsum_dtype_spy(monkeypatch):
+    seen = []
+    real_einsum = torch.einsum
+
+    def spy(eq, *operands, **kw):
+        seen.append(tuple(o.dtype for o in operands))
+        return real_einsum(eq, *operands, **kw)
+
+    monkeypatch.setattr(torch, "einsum", spy)
+    return seen
+
+
+@module_test
+def test_trimul_a1_keeps_fp32_operands_on_cpu(monkeypatch):
+    """Guard is False on CPU, so einsum must still receive fp32 — no silent
+    precision drop on the device where the downcast is not guaranteed."""
+    block, pair_grid, visibility = _trimul_case(chunk=None)
+    seen = _einsum_dtype_spy(monkeypatch)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        block(pair_grid, visibility)
+    assert seen and all(d == torch.float32 for dts in seen for d in dts), seen
+
+
+@module_test
+def test_trimul_a1_promotes_to_fp32_without_autocast(monkeypatch):
+    block, pair_grid, visibility = _trimul_case(chunk=None)
+    seen = _einsum_dtype_spy(monkeypatch)
+    block(pair_grid, visibility)
+    assert seen and all(d == torch.float32 for dts in seen for d in dts)
+
+
+@module_test
+def test_trimul_a1_mask_still_zeroes_padding():
+    """Sanity: casting the mask down must not break masking semantics."""
+    block, pair_grid, visibility = _trimul_case(chunk=None, L=6)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        masked = block(pair_grid, visibility)
+        unmasked = block(pair_grid, torch.ones_like(visibility))
+    assert not torch.equal(masked, unmasked)
+
+
+# --------------------------- CUDA: the actual fast path ---------------------------
+@module_test
+@_needs_cuda
+@pytest.mark.parametrize("flow", ["outgoing", "incoming"])
+@pytest.mark.parametrize("chunk", [None, 1, 64, 128])
+@pytest.mark.parametrize("L", [1, 2, 7, 65, 130])
+def test_trimul_a1_bitexact_cuda_autocast(flow, chunk, L):
+    """The real claim: with the guard firing on CUDA, output is bit-identical to
+    the pre-A1 code. Covers L==1 (the CPU counterexample) and strided views into
+    `routed` at chunked production-ish shapes."""
+    block, pair_grid, visibility = _trimul_case(
+        flow=flow, chunk=chunk, L=L, device="cuda"
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        new = block(pair_grid, visibility)
+        old = _trimul_forward_pre_a1(block, pair_grid, visibility)
+    assert torch.equal(new, old), (
+        f"A1 changed output on CUDA (flow={flow}, chunk={chunk}, L={L}); "
+        f"max|delta|={(new.float() - old.float()).abs().max().item():.3e}"
+    )
+
+
+@module_test
+@_needs_cuda
+def test_trimul_a1_keeps_einsum_operands_in_bf16_on_cuda(monkeypatch):
+    """Behavioural proof A1 actually removes the fp32 materialization."""
+    block, pair_grid, visibility = _trimul_case(chunk=None, device="cuda")
+    seen = _einsum_dtype_spy(monkeypatch)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        block(pair_grid, visibility)
+    assert seen and all(d == torch.bfloat16 for dts in seen for d in dts), seen
+
+
+@module_test
+@_needs_cuda
+def test_trimul_a1_bitexact_bf16_input_no_autocast_cuda():
+    """bf16 input WITHOUT autocast: einsum would not downcast, so the fp32
+    contract must be preserved rather than silently dropped to bf16."""
+    block, pair_grid, visibility = _trimul_case(chunk=None, device="cuda")
+    block = block.to(torch.bfloat16)
+    pair_grid = pair_grid.to(torch.bfloat16)
+    new = block(pair_grid, visibility)
+    old = _trimul_forward_pre_a1(block, pair_grid, visibility)
+    assert torch.equal(new, old)

@@ -2264,6 +2264,51 @@ def compute_lm_hidden_states(
 # ===========================================================================
 # TriangleMultiplicativeUpdate
 # ===========================================================================
+# Device types whose autocast dispatch registers a kernel for ``aten::einsum``
+# (ATen's AT_FORALL_LOWER_PRECISION_FP list). This MUST stay a whitelist:
+# AutocastCPU deliberately omits einsum — it is a registered *fallthrough* there,
+# so on CPU any downcast happens only incidentally inside einsum's
+# ``sumproduct_pair`` decomposition, at the internal ``bmm``. When the contracted
+# dimension has extent 1 that decomposition short-circuits to ``mul`` and no
+# downcast happens at all, which makes a preceding ``.float()`` load-bearing
+# rather than dead. Adding "cpu" here would silently change results at L == 1.
+_EINSUM_AUTOCAST_DEVICES = frozenset({"cuda", "xpu", "mps", "mtia", "maia"})
+
+
+def _autocast_downcasts(t: Tensor) -> bool:
+    """True when autocast casts ``t`` to its own dtype at ``torch.einsum`` entry.
+
+    On the device types in ``_EINSUM_AUTOCAST_DEVICES``, ``einsum`` is registered
+    under autocast's ``lower_precision_fp`` policy, so when the ambient autocast
+    dtype already equals ``t.dtype``, an explicit ``.float()`` before the call is
+    round-tripped away — widening to fp32 and narrowing back is exact. Callers use
+    this to skip that dead fp32 materialization without changing a single bit.
+
+    Fails closed. Returns False for CPU (see ``_EINSUM_AUTOCAST_DEVICES``), for
+    device types this build's autocast does not recognize, and generally whenever
+    the round-trip is not provably dead — so the fp32 path stays the default.
+    """
+    if t.dtype == torch.float32 or not t.is_floating_point():
+        return False
+    dev = t.device.type
+    if dev not in _EINSUM_AUTOCAST_DEVICES:
+        return False
+    try:
+        return (
+            torch.is_autocast_enabled(dev)
+            and torch.get_autocast_dtype(dev) == t.dtype
+        )
+    except (TypeError, RuntimeError):
+        # TypeError: torch < 2.4 (device-agnostic query, CUDA-only autocast).
+        # RuntimeError: a device type whose autocast state this build cannot
+        # query (e.g. meta/lazy) — fall through to False rather than raising.
+        return (
+            dev == "cuda"
+            and torch.is_autocast_enabled()
+            and torch.get_autocast_gpu_dtype() == t.dtype
+        )
+
+
 class TriangleMultiplicativeBlock(nn.Module):
     """Triangle multiplicative update block with gated signal routing."""
 
@@ -2370,14 +2415,31 @@ class TriangleMultiplicativeBlock(nn.Module):
         bundled = self.proj_bundle(normalized_grid)
         signal, gate_logits = bundled.split(2 * self.latent_channels, dim=-1)
         routed = signal * torch.sigmoid(gate_logits)
-        routed = routed * visibility.unsqueeze(-1)
+        # `visibility` is a 0/1 mask: fp32 on the trunk/confidence paths
+        # (`mask[..., None].float() * mask[..., None, :].float()`) and bool on the
+        # MSA-encoder path (`tok_mask.unsqueeze(2) & tok_mask.unsqueeze(1)`). An
+        # fp32 mask type-promotes a bf16 `routed` — the block's largest surviving
+        # intermediate — all the way to fp32; cast the mask down instead. Exact
+        # either way, but ONLY because the mask holds exactly 0.0/1.0, which every
+        # float dtype represents, so v*1 == v and v*0 == 0 bit-for-bit. A
+        # fractional (soft) mask would NOT be exact here — it would shift the bf16
+        # result by ~4e-3. Keep the 0/1 invariant if you add mask semantics.
+        routed = routed * visibility.unsqueeze(-1).to(routed.dtype)
         # `bundled` (and its views signal/gate_logits) is the largest tensor in
         # the block ([..., 4*latent]) and is dead once `routed` is formed; free
         # it before the L^2 einsum. `normalized_grid` is kept — the output gate
         # below still reads it. Memory-only; arithmetic unchanged.
         del bundled, signal, gate_logits
 
-        left_stream, right_stream = routed.float().chunk(2, dim=-1)
+        # Under bf16 autocast the fp32 copy below is materialized only for
+        # `einsum` to immediately downcast it again — and with chunking the full
+        # fp32 `right_stream` is re-read and re-cast once per chunk (16x at
+        # L=1000 with chunk=64). Skip it only when the downcast is provably
+        # dead; otherwise keep the fp32 contract exactly as it was.
+        if _autocast_downcasts(routed):
+            left_stream, right_stream = routed.chunk(2, dim=-1)
+        else:
+            left_stream, right_stream = routed.float().chunk(2, dim=-1)
         del routed
         if self._chunk_size is not None:
             contracted = self._triangular_contract_chunked(
