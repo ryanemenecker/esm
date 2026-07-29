@@ -22,11 +22,14 @@ Examples::
     # query vs a library of targets
     esmfold2-fold --sequence MKTAYIAKQR... --targets targets.fasta -o out
 
-    # a single sequence, no L^2 chunking (fastest for short sequences)
-    esmfold2-fold --sequence MKTAYIAKQR... --chunk-size none
+    # a single sequence
+    esmfold2-fold --sequence MKTAYIAKQR...
 
-    # fold every sequence in a FASTA with a smaller chunk for long inputs
-    esmfold2-fold --fasta proteins.fasta --chunk-size 32 -o out
+    # cap memory on a very long input
+    esmfold2-fold --fasta proteins.fasta --chunk-size 64 -o out
+
+    # bit-reproducible: for checking that a code change did not alter output
+    esmfold2-fold --fasta proteins.fasta --reproducible -o out
 
 Equivalent to ``python -m esm.models.esmfold2.fold_cli ...``.
 """
@@ -34,6 +37,7 @@ Equivalent to ``python -m esm.models.esmfold2.fold_cli ...``.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import statistics
 import sys
@@ -41,13 +45,48 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-# Sentinel meaning "--chunk-size was not supplied" — leave the model's own
-# default (64) untouched. Distinct from the value None, which means the user
-# explicitly asked to DISABLE chunking.
+# Sentinel meaning "--chunk-size was not supplied" — resolve it from
+# --num-diffusion-samples via ``resolve_chunk_size``. Distinct from the value
+# None, which means the user explicitly asked to DISABLE chunking.
 _CHUNK_UNSET = object()
 
 # Soft advisory bounds for --chunk-size (not hard limits).
 _CHUNK_SMALL_WARN = 8
+
+# Chunking the L^2 trunk ops partitions only the triangle-multiply einsum's
+# OUTPUT rows while handing the full right-hand stream to every chunk, so the
+# live byte set during the einsum is unchanged and the chunkable tensor is ~3%
+# of peak. Measured at L=780, samples=1: chunk=none is 1.77x FASTER than 64 for
+# 0.03 GiB more peak, and is the reference (unchunked) path the bit-exactness
+# tests compare against. So disable chunking by default at samples=1.
+#
+# It does matter at multiple diffusion samples: the confidence-head trunk then
+# runs at batch=samples, where the pair-transition SwiGLU x12 ([B,L,L,2048]) is
+# ~30 GiB unchunked vs ~2 GiB chunked at L=1000. Keep 64 there.
+_CHUNK_DEFAULT_SINGLE_SAMPLE = None
+_CHUNK_DEFAULT_MULTI_SAMPLE = 64
+
+
+def resolve_chunk_size(chunk_size, num_diffusion_samples: int):
+    """Resolve ``--chunk-size`` when it was not supplied.
+
+    Returns ``(value, explanation)``. An explicit ``--chunk-size`` is always
+    honoured verbatim; otherwise the default depends on how many diffusion
+    samples are drawn, since that is what decides whether the un-chunked
+    confidence-head trunk fits (see ``_CHUNK_DEFAULT_*``).
+    """
+    if chunk_size is not _CHUNK_UNSET:
+        return chunk_size, "explicit --chunk-size"
+    if num_diffusion_samples <= 1:
+        return (
+            _CHUNK_DEFAULT_SINGLE_SAMPLE,
+            "default for --num-diffusion-samples 1 (1.77x faster, +0.03 GiB peak)",
+        )
+    return (
+        _CHUNK_DEFAULT_MULTI_SAMPLE,
+        f"default for --num-diffusion-samples {num_diffusion_samples} "
+        "(un-chunked needs ~30 GiB for the confidence-head trunk at batch>1)",
+    )
 
 
 @dataclass
@@ -63,8 +102,10 @@ def parse_chunk_size(value: str):
 
     Accepts a positive integer (the token-axis chunk width for the L^2 trunk
     ops: triangle multiply / outer-product-mean / pair transition), or one of
-    ``none``/``off``/``disable``/``0`` to disable chunking entirely (faster for
-    short sequences, but higher peak memory and OOM-prone past L~600).
+    ``none``/``off``/``disable``/``0`` to disable chunking entirely. Disabling
+    is measurably faster and costs almost nothing in peak memory at one
+    diffusion sample (L=780: 1.77x faster, +0.03 GiB), which is why it is the
+    default there — see ``resolve_chunk_size``.
 
     Returns ``int > 0`` or ``None`` (disable).
     """
@@ -83,6 +124,80 @@ def parse_chunk_size(value: str):
             f"--chunk-size must be >= 1 (or none/0 to disable), got {n}"
         )
     return n
+
+
+def parse_lm_dropout(value: str) -> float:
+    """argparse type for ``--lm-dropout``: a probability in [0, 1)."""
+    try:
+        p = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--lm-dropout must be a number in [0, 1), got {value!r}"
+        )
+    if not (0.0 <= p < 1.0):
+        raise argparse.ArgumentTypeError(
+            f"--lm-dropout must be >= 0 and < 1, got {p}"
+        )
+    return p
+
+
+def resolve_reproducibility(reproducible, lm_dropout, seed, deterministic):
+    """Resolve the three knobs that together make a fold bit-reproducible.
+
+    ESMFold2 is a *sampler* by default: ``lm_dropout`` (esm's API default 0.3)
+    draws a fresh mask every recycling loop, and the diffusion head is
+    stochastic, so repeated folds of one sequence differ by several Angstroms at
+    long L. Three things must line up for bit-identical output (verified at
+    L=780, where all parity contrasts came out exactly 0.0000 A):
+
+    1. ``lm_dropout=0``   — stop drawing ensemble members
+    2. a fixed ``seed``   — pin the diffusion sampling
+    3. ``deterministic``  — deterministic CUDA kernels
+
+    ``--reproducible`` sets all three, because setting only some of them is the
+    trap that makes a "regression" look real when it is just a different draw.
+
+    Returns ``(lm_dropout, seed, deterministic, notes)``. ``lm_dropout`` stays
+    ``None`` when unset, which means "do not pass the kwarg" so esm's own
+    default applies — passing ``None`` explicitly is NOT the same thing, since
+    that would fall back to the checkpoint's config value instead of 0.3.
+    """
+    notes: list[str] = []
+    if not reproducible:
+        return lm_dropout, seed, deterministic, notes
+
+    if lm_dropout is not None and lm_dropout != 0.0:
+        raise ValueError(
+            f"--reproducible requires lm_dropout=0 but --lm-dropout {lm_dropout} "
+            "was given. With dropout on, every fold is a different draw from an "
+            "ensemble, so the run cannot be reproducible. Drop one of the flags."
+        )
+
+    if lm_dropout is None:
+        notes.append("--lm-dropout 0 (was esm's default 0.3)")
+    lm_dropout = 0.0
+    if seed is None:
+        seed = 0
+        notes.append("--seed 0")
+    if not deterministic:
+        notes.append("--deterministic")
+    deterministic = True
+    return lm_dropout, seed, deterministic, notes
+
+
+def apply_deterministic(enabled: bool, torch_mod) -> bool:
+    """Enable deterministic CUDA kernels. Returns whether anything was applied.
+
+    ``CUBLAS_WORKSPACE_CONFIG`` is read by cuBLAS when it initializes, so
+    exporting it before launch is strictest; setting it here covers the common
+    case. ``warn_only=True`` lets ops with no deterministic implementation fall
+    back rather than raising mid-fold.
+    """
+    if not enabled:
+        return False
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch_mod.use_deterministic_algorithms(True, warn_only=True)
+    return True
 
 
 def resolve_device(gpu, device, *, cuda_available: bool, device_count: int) -> str:
@@ -257,9 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=_CHUNK_UNSET,
         metavar="N|none",
         help=(
-            "Token-axis chunk for the L^2 trunk ops. Lower = less peak memory, "
-            "more overhead; 'none' (or 0) disables chunking (fastest for short "
-            "sequences, OOM-prone past L~600). Default: model's own value (64)."
+            "Token-axis chunk for the L^2 trunk ops. Lower = slightly less peak "
+            "memory, notably more overhead; 'none' (or 0) disables chunking. "
+            "Default: none at --num-diffusion-samples 1 (measured 1.77x faster "
+            "for +0.03 GiB peak at L=780), else 64."
         ),
     )
 
@@ -275,6 +391,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parallel structure samples per input (default: 1).",
     )
     fold.add_argument("--seed", type=int, default=None, help="Random seed (default: unset).")
+
+    repro = p.add_argument_group(
+        "reproducibility",
+        "ESMFold2 is a sampler by default: LM dropout draws a fresh mask every "
+        "recycling loop and the diffusion head is stochastic, so folding one "
+        "sequence twice gives different structures (several Angstroms apart at "
+        "long L). Use --reproducible to pin all of it.",
+    )
+    repro.add_argument(
+        "--reproducible",
+        action="store_true",
+        help="Make the run bit-reproducible: implies --lm-dropout 0, "
+        "--deterministic, and --seed 0 if no seed was given. Use this when "
+        "verifying that a code change did not alter output — at these settings "
+        "repeated folds are bit-identical (verified at L=780).",
+    )
+    repro.add_argument(
+        "--lm-dropout",
+        type=parse_lm_dropout,
+        default=None,
+        metavar="P",
+        help="Per-loop LM dropout probability in [0, 1). This is an intentional "
+        "stochastic ensemble knob: >0 means each fold is a different draw. "
+        "Default: unset, i.e. esm's own default (0.3). Pass 0 to disable.",
+    )
+    repro.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic CUDA kernels (sets CUBLAS_WORKSPACE_CONFIG=:4096:8). "
+        "Slightly slower; needed for bit-identical output.",
+    )
+
     fold.add_argument(
         "--no-offload-esmc",
         action="store_true",
@@ -395,6 +543,31 @@ def run(args: argparse.Namespace) -> int:
             print(f"error: --{knob.replace('_', '-')} must be >= 1", file=sys.stderr)
             return 2
 
+    # Resolve reproducibility before anything touches CUDA, so the deterministic
+    # cuBLAS workspace setting is in place before the context initializes.
+    try:
+        lm_dropout, seed, deterministic, repro_notes = resolve_reproducibility(
+            args.reproducible, args.lm_dropout, args.seed, args.deterministic
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if repro_notes:
+        print(f"Reproducible mode: set {', '.join(repro_notes)}.")
+    if apply_deterministic(deterministic, torch):
+        print(
+            "Deterministic CUDA kernels enabled (CUBLAS_WORKSPACE_CONFIG=:4096:8). "
+            "Export that variable before launching for strictest effect."
+        )
+    if lm_dropout == 0.0:
+        print("LM dropout disabled — output is deterministic given a fixed seed.")
+    elif lm_dropout is None:
+        print(
+            "note: LM dropout is at esm's default (0.3), so this fold is one draw "
+            "from a stochastic ensemble; repeated runs will differ. Use "
+            "--reproducible to pin it."
+        )
+
     jobs = resolve_jobs(args.sequence, args.targets, args.fasta, args.query_name)
     print(f"Prepared {len(jobs)} prediction(s).")
 
@@ -426,17 +599,19 @@ def run(args: argparse.Namespace) -> int:
         print(f"Loading model {args.model!r} on {device} ...")
         model = ESMFold2Model.from_pretrained(args.model).to(device).eval()
 
-    if args.chunk_size is not _CHUNK_UNSET:
-        model.set_chunk_size(args.chunk_size)
-        if args.chunk_size is None:
-            print("Chunking disabled (--chunk-size none).")
-        else:
-            if args.chunk_size < _CHUNK_SMALL_WARN:
-                print(
-                    f"note: --chunk-size {args.chunk_size} is small; it minimizes "
-                    "memory but adds per-chunk overhead."
-                )
-            print(f"Set L^2 chunk size to {args.chunk_size}.")
+    chunk_size, chunk_why = resolve_chunk_size(
+        args.chunk_size, args.num_diffusion_samples
+    )
+    model.set_chunk_size(chunk_size)
+    if chunk_size is None:
+        print(f"Chunking disabled ({chunk_why}).")
+    else:
+        if chunk_size < _CHUNK_SMALL_WARN:
+            print(
+                f"note: --chunk-size {chunk_size} is small; it minimizes "
+                "memory but adds per-chunk overhead."
+            )
+        print(f"L^2 chunk size {chunk_size} ({chunk_why}).")
 
     builder = ESMFold2InputBuilder()
     inputs = [_build_spi(job) for job in jobs]
@@ -446,9 +621,14 @@ def run(args: argparse.Namespace) -> int:
         num_loops=args.num_loops,
         num_sampling_steps=args.num_sampling_steps,
         num_diffusion_samples=args.num_diffusion_samples,
-        seed=args.seed,
+        seed=seed,
         complex_id=complex_ids,
     )
+    # Only pass lm_dropout when the user set it. Passing None is NOT equivalent
+    # to omitting it: esm's fold/fold_batch default is 0.3, whereas None makes
+    # _lm_dropout_context a no-op and falls back to the checkpoint's config value.
+    if lm_dropout is not None:
+        fold_kwargs["lm_dropout"] = lm_dropout
 
     def _do_fold():
         if args.stage_loading:

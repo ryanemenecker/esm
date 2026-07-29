@@ -491,10 +491,10 @@ def cmd_matrix(args) -> int:
         tf, to = fo.get("_time"), oo.get("_time")
         if tf and to:
             print(f"    fold time: orig {to:.1f}s -> fork {tf:.1f}s ({to / tf:.2f}x)")
-        print("  NOTE: at short L the OVERALL peak is set by the ESMC encode phase, which")
-        print("  is identical for both, so the edits cannot move it. They shrink the L^2")
-        print("  fold working set — rerun with a long --seq for the regime where that")
-        print("  dominates and the peak actually drops.")
+        print("  NOTE: the edits are not expected to move the PEAK. Measured at L=780,")
+        print("  the fold-phase peak is set by the pair-transition SwiGLU x12")
+        print("  ([1,L,L,2048] bf16, ~3.8 GiB), which the edits do not touch; they")
+        print("  shrink the trimul working set, which shows up in the MEDIAN.")
 
     print("\nPairwise differences:")
     for gname, pairs in _MATRIX_GROUPS:
@@ -507,12 +507,23 @@ def cmd_matrix(args) -> int:
             else:
                 print(f"    {a_label:16s} vs {b_label:18s}: {_fmt_pair(_pair_metrics(a, b))}")
 
-    print(
-        "\nInterpretation: judge every contrast against the NOISE FLOOR. If OFFLOAD "
-        "IMPACT and CODE IMPACT are ~the floor, then offloading ESMC and this fork's "
-        "edits are both output-preserving — the differences are the model's own "
-        "run-to-run non-determinism, not systematic effects."
-    )
+    if args.lm_dropout == 0 and getattr(args, "deterministic", False):
+        print(
+            "\nInterpretation: at the default gate (--lm-dropout 0 --deterministic) "
+            "every contrast should be EXACTLY 0.0000 A — verified at L=780. There is "
+            "no tolerance to allow here: any nonzero RMSD is a real regression. Gate "
+            "on coordinate RMSD, not pLDDT/pTM (those are trunk-head outputs and stay "
+            "flat even at 5+ A of coordinate divergence)."
+        )
+    else:
+        print(
+            "\nInterpretation: judge every contrast against the NOISE FLOOR. NOTE that "
+            "with --lm-dropout > 0 the model is a sampler, so contrasts measure which "
+            "ensemble member was drawn (observed 4-5 A at L=780) and NOT parity — a "
+            "one-element RNG shift gives a completely different dropout mask. For a "
+            "parity verdict use the defaults (--lm-dropout 0 --deterministic), where "
+            "the expected result is bit-identical output."
+        )
     return 0
 
 
@@ -787,16 +798,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lm-dropout",
         type=float,
-        default=0.3,
-        help="Per-loop LM dropout (model default 0.3 — an intentional stochastic "
-        "ensemble knob). Set 0 to disable, e.g. to test whether it drives the "
-        "fork+offload variance.",
+        default=0.0,
+        help="Per-loop LM dropout. DEFAULT 0 — this is a parity harness, and with "
+        "dropout on the model is a sampler (a fresh mask per recycling loop over "
+        "the whole [1,L,L,256] pair tensor), so a single structure is a draw, not "
+        "a value: contrasts then measure ensemble membership, not parity. Set 0.3 "
+        "(the model default) only to study the ensemble spread itself.",
     )
     p.add_argument(
         "--deterministic",
-        action="store_true",
-        help="Force deterministic CUDA algorithms (diagnostic): if this collapses "
-        "the fork+offload variance, the cause is non-deterministic GPU kernels.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force deterministic CUDA algorithms. DEFAULT ON: with this plus "
+        "--lm-dropout 0, offload and this fork's edits are bit-identical to "
+        "upstream (verified at L=780: all contrasts exactly 0.0000 A), so any "
+        "nonzero difference is a real regression. --no-deterministic to measure "
+        "kernel non-determinism instead.",
     )
     p.add_argument(
         "--repeat",

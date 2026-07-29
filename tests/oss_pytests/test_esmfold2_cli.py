@@ -279,3 +279,143 @@ def test_write_result_multisample(tmp_path):
     assert [p.name for p in paths] == ["j_sample0.cif", "j_sample1.cif"]
     assert (tmp_path / "j_sample0.cif").read_text() == "C0"
     assert (tmp_path / "j_sample1.cif").read_text() == "C1"
+
+
+# --------------------------- chunk-size default resolution ---------------------------
+# Chunking is a poor trade at one diffusion sample (measured L=780: chunk=none is
+# 1.77x faster for +0.03 GiB peak, because chunking partitions only the trimul
+# einsum's output rows -- ~3% of peak -- while re-reading the full right-hand
+# stream per chunk). It DOES matter at samples>1, where the confidence-head trunk
+# runs at batch=samples. So the default is length-independent but sample-dependent.
+def test_resolve_chunk_size_default_single_sample():
+    val, why = fold_cli.resolve_chunk_size(fold_cli._CHUNK_UNSET, 1)
+    assert val is None
+    assert "1.77x" in why
+
+
+def test_resolve_chunk_size_default_multi_sample():
+    for n in (2, 8):
+        val, why = fold_cli.resolve_chunk_size(fold_cli._CHUNK_UNSET, n)
+        assert val == 64, n
+        assert "confidence-head" in why
+
+
+def test_resolve_chunk_size_honours_explicit_value():
+    # An explicit --chunk-size always wins, including an explicit "none".
+    assert fold_cli.resolve_chunk_size(32, 1) == (32, "explicit --chunk-size")
+    assert fold_cli.resolve_chunk_size(32, 8) == (32, "explicit --chunk-size")
+    assert fold_cli.resolve_chunk_size(None, 8)[0] is None
+    assert fold_cli.resolve_chunk_size(256, 1)[0] == 256
+
+
+def test_resolve_chunk_size_zero_and_negative_samples_treated_as_single():
+    # Defensive: num_diffusion_samples <= 1 all take the single-sample default.
+    assert fold_cli.resolve_chunk_size(fold_cli._CHUNK_UNSET, 0)[0] is None
+
+
+# --------------------------- --lm-dropout parsing ---------------------------
+@pytest.mark.parametrize("val,expected", [("0", 0.0), ("0.0", 0.0), ("0.3", 0.3), ("0.99", 0.99)])
+def test_parse_lm_dropout_valid(val, expected):
+    assert fold_cli.parse_lm_dropout(val) == expected
+
+
+@pytest.mark.parametrize("val", ["-0.1", "1", "1.5", "abc", "", "none"])
+def test_parse_lm_dropout_invalid(val):
+    # p must be in [0, 1): 1.0 would zero the whole LM signal.
+    with pytest.raises(argparse.ArgumentTypeError):
+        fold_cli.parse_lm_dropout(val)
+
+
+# --------------------------- reproducibility resolution ---------------------------
+# Bit-identical output needs all three of: lm_dropout=0, a fixed seed, and
+# deterministic kernels. Setting only some of them is the trap that makes a
+# different ensemble draw look like a regression.
+def test_reproducible_sets_all_three_knobs():
+    lm, seed, det, notes = fold_cli.resolve_reproducibility(True, None, None, False)
+    assert lm == 0.0 and seed == 0 and det is True
+    joined = " ".join(notes)
+    assert "--lm-dropout 0" in joined and "--seed 0" in joined and "--deterministic" in joined
+
+
+def test_reproducible_keeps_explicit_seed():
+    lm, seed, det, notes = fold_cli.resolve_reproducibility(True, None, 42, False)
+    assert (lm, seed, det) == (0.0, 42, True)
+    assert "--seed" not in " ".join(notes)  # user's seed was honoured, not overridden
+
+
+def test_reproducible_accepts_explicit_zero_dropout():
+    lm, seed, det, notes = fold_cli.resolve_reproducibility(True, 0.0, 7, True)
+    assert (lm, seed, det) == (0.0, 7, True)
+    assert notes == []  # nothing had to be changed
+
+
+def test_reproducible_rejects_nonzero_dropout():
+    # Contradiction: dropout on means every fold is a different draw.
+    with pytest.raises(ValueError, match="requires lm_dropout=0"):
+        fold_cli.resolve_reproducibility(True, 0.3, None, False)
+
+
+def test_without_reproducible_nothing_is_forced():
+    # Unset lm_dropout must stay None so run() OMITS the kwarg and esm's own
+    # default (0.3) applies — passing None would instead fall back to the
+    # checkpoint config value, which is a different number.
+    assert fold_cli.resolve_reproducibility(False, None, None, False) == (None, None, False, [])
+    assert fold_cli.resolve_reproducibility(False, 0.3, 5, True) == (0.3, 5, True, [])
+
+
+def test_apply_deterministic_noop_when_disabled():
+    class _T:
+        def use_deterministic_algorithms(self, *a, **k):
+            raise AssertionError("must not be called when disabled")
+
+    assert fold_cli.apply_deterministic(False, _T()) is False
+
+
+def test_apply_deterministic_sets_env_and_flag(monkeypatch):
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    calls = []
+
+    class _T:
+        def use_deterministic_algorithms(self, val, warn_only=False):
+            calls.append((val, warn_only))
+
+    assert fold_cli.apply_deterministic(True, _T()) is True
+    import os as _os
+
+    assert _os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    # warn_only so ops lacking a deterministic kernel fall back instead of raising
+    assert calls == [(True, True)]
+
+
+def test_apply_deterministic_respects_preset_env(monkeypatch):
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
+    class _T:
+        def use_deterministic_algorithms(self, *a, **k):
+            pass
+
+    fold_cli.apply_deterministic(True, _T())
+    import os as _os
+
+    assert _os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"  # user's value wins
+
+
+# --------------------------- parser plumbing ---------------------------
+def test_parser_reproducibility_defaults():
+    args = fold_cli.build_parser().parse_args(["--sequence", "MK"])
+    assert args.reproducible is False
+    assert args.lm_dropout is None  # unset -> inherit esm's default
+    assert args.deterministic is False
+
+
+def test_parser_reproducibility_flags():
+    p = fold_cli.build_parser()
+    args = p.parse_args(["--sequence", "MK", "--reproducible"])
+    assert args.reproducible is True
+    args = p.parse_args(["--sequence", "MK", "--lm-dropout", "0", "--deterministic"])
+    assert args.lm_dropout == 0.0 and args.deterministic is True
+
+
+def test_parser_rejects_bad_lm_dropout():
+    with pytest.raises(SystemExit):
+        fold_cli.build_parser().parse_args(["--sequence", "MK", "--lm-dropout", "1.0"])

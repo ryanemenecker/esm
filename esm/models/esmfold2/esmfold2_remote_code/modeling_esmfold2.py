@@ -63,8 +63,12 @@ _NONPOLYMER_ID = 4
 # Default for the triangle / OPM / pair-transition L² ops. Caps peak memory
 # so L≈2k folds on an 80 GB GPU (~76 GB peak at chunk=128 for L=1438;
 # chunk=64 leaves headroom for the largest foldbench targets). Override via
-# ``model.set_chunk_size(...)``; pass None to disable chunking (faster for
-# short L but OOM-prone past ~600).
+# ``model.set_chunk_size(...)``; pass None to disable chunking. NOTE: at ONE
+# diffusion sample, disabling is measurably better -- L=780 measured 1.77x
+# faster for +0.03 GiB peak -- because chunking partitions only the trimul
+# einsum's output rows (~3% of peak) while re-reading the full right-hand
+# stream per chunk. It matters at samples>1, where the confidence-head trunk
+# runs at batch=samples and the pair-transition SwiGLU dominates.
 _DEFAULT_CHUNK_SIZE = 64
 
 

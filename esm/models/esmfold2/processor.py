@@ -598,6 +598,8 @@ class ESMFold2InputBuilder:
                 "for models without a detachable ESMC backbone."
             )
 
+        self._reject_unappliable_lm_mask_pct(model, lm_mask_pct)
+
         # Capture the compute device once, before any offload can change what
         # `model.device` reports.
         compute_device = model.device
@@ -791,6 +793,8 @@ class ESMFold2InputBuilder:
                 "'bf16'/'fp32' here."
             )
 
+        self._reject_unappliable_lm_mask_pct(model, lm_mask_pct)
+
         # Clean staged start: drop any attached ESMC and force the folding stack
         # to CPU, so nothing but ESMC will sit on `device` during encoding.
         model._esmc = None
@@ -870,6 +874,37 @@ class ESMFold2InputBuilder:
             self._empty_cache(compute_device)
 
         return results
+
+    @staticmethod
+    def _reject_unappliable_lm_mask_pct(model: Any, lm_mask_pct: float | None) -> None:
+        """Fail loudly when ``lm_mask_pct`` could not be honoured on this path.
+
+        LM token masking is applied inside the model's *inline* ESMC call. The
+        precomputed-embedding paths supply ``lm_hidden_states``, which makes
+        ``forward`` skip that call entirely — so a nonzero ``lm_mask_pct`` would
+        be silently dropped, giving different LM inputs (and one fewer
+        L-dependent RNG draw) than the inline path. That is exactly the kind of
+        quiet divergence these paths exist to avoid, so raise instead.
+
+        No-op for the common cases: falsy ``lm_mask_pct``, or a model whose
+        ``_compute_lm_hidden_states`` accepts it (then encoding can apply it).
+        """
+        if not lm_mask_pct:
+            return
+        try:
+            params = inspect.signature(model._compute_lm_hidden_states).parameters
+        except (AttributeError, TypeError, ValueError):
+            params = {}
+        if "lm_mask_pct" in params:
+            return
+        raise ValueError(
+            f"lm_mask_pct={lm_mask_pct!r} cannot be applied when ESMC embeddings "
+            "are precomputed: this model's _compute_lm_hidden_states() does not "
+            "accept it, and supplying lm_hidden_states makes forward() skip the "
+            "inline ESMC call where masking happens. Passing it would silently "
+            "diverge from the inline path. Use fold() (or offload_esmc=False) if "
+            "you need LM token masking, or drop lm_mask_pct."
+        )
 
     def _encode_lm_hidden_states(
         self,

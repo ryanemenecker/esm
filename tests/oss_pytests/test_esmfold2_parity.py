@@ -184,19 +184,24 @@ def test_parse_sweep_sizes():
     assert parity._parse_sweep_sizes("64") == [64]
 
 
-def test_lm_dropout_flag_flows_to_fold_kwargs():
+def test_lm_dropout_defaults_off_for_parity():
+    # DEFAULT 0, not the model's 0.3: with dropout on, a single structure is a
+    # draw from an ensemble, so contrasts measure which member was sampled rather
+    # than parity (measured 4-5 A at L=780). Opt back in explicitly.
     args = parity.build_parser().parse_args(["--ab"])
-    assert args.lm_dropout == 0.3  # default matches the model
-    assert parity._fold_kwargs(args)["lm_dropout"] == 0.3
-    args = parity.build_parser().parse_args(["--ab", "--lm-dropout", "0"])
+    assert args.lm_dropout == 0.0
     assert parity._fold_kwargs(args)["lm_dropout"] == 0.0
+    args = parity.build_parser().parse_args(["--ab", "--lm-dropout", "0.3"])
+    assert parity._fold_kwargs(args)["lm_dropout"] == 0.3
 
 
-def test_deterministic_flag_noop_when_unset():
-    # Unset -> _maybe_deterministic does nothing (no torch state change, no throw).
-    args = parity.build_parser().parse_args(["--ab"])
+def test_deterministic_defaults_on_and_can_be_disabled():
+    # DEFAULT ON so the gate is bit-exactness (verified: all contrasts exactly
+    # 0.0000 A at L=780), with --no-deterministic to measure kernel jitter.
+    assert parity.build_parser().parse_args(["--ab"]).deterministic is True
+    args = parity.build_parser().parse_args(["--ab", "--no-deterministic"])
     assert args.deterministic is False
-    parity._maybe_deterministic(args)  # should be a no-op, not raise
+    parity._maybe_deterministic(args)  # no-op when disabled, must not raise
 
 
 def test_self_repeat_mocked(capsys, monkeypatch):

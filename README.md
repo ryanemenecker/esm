@@ -286,13 +286,28 @@ Mode 1 writes `query__<target>.cif` per target (rename the query with
 `--query-name`); mode 3 writes one `<header>.cif` per sequence.
 
 **Controlling peak memory with `--chunk-size`.** The L²-heavy trunk operations
-(triangle multiply, outer-product mean, pair transition) are computed in chunks
-along the token axis. A smaller chunk lowers peak GPU memory at the cost of some
-overhead; disabling chunking is fastest for short sequences but memory-hungry
-(and OOM-prone past ~600 residues). The model default is `64`.
+(triangle multiply, outer-product mean, pair transition) can be computed in
+chunks along the token axis.
+
+The default is **`none` (chunking disabled) at `--num-diffusion-samples 1`**, and
+`64` above that. Chunking turns out to be a poor trade at one sample: it
+partitions only the triangle-multiply einsum's *output rows* — about 3% of peak —
+while handing the full right-hand stream to every chunk, so it costs time without
+meaningfully lowering peak memory. Measured at L=780 on one GPU:
+
+| `--chunk-size` | fold time | peak GPU memory |
+| --- | --- | --- |
+| `none` | **126.5 s** | 14.65 GiB |
+| `64` (old default) | 223.9 s | 14.68 GiB |
+
+That is a **1.77× speedup for 0.03 GiB**, and `none` is the *reference* unchunked
+path the bit-exactness tests compare against — not an approximation. Chunking
+does matter at multiple diffusion samples, where the confidence-head trunk runs
+at batch = samples and the pair-transition SwiGLU becomes the dominant tensor;
+the default switches back to `64` there.
 
 ```bash
-esmfold2-fold --fasta proteins.fasta --chunk-size 32      # smaller chunk for long/large inputs
+esmfold2-fold --fasta proteins.fasta --chunk-size 64      # cap memory on very long inputs
 esmfold2-fold --sequence MKTAYIAKQR... --chunk-size none  # disable chunking (also: off / 0)
 ```
 
@@ -336,27 +351,69 @@ Common options (run `esmfold2-fold --help` for the full list):
 | `--targets`, `-t` | FASTA of targets; each folded as a complex with `--sequence`. |
 | `--fasta`, `-f` | FASTA of sequences; each folded individually. |
 | `--output-dir`, `-o` | Directory for the `.cif` outputs (default: `esmfold2_out`). |
-| `--chunk-size` | L² chunk size (positive int, or `none`/`0`); default: model's value (64). |
-| `--num-loops`, `--num-sampling-steps`, `--num-diffusion-samples` | Folding knobs (defaults: 20 / 200 / 1). |
-| `--seed` | Random seed for reproducibility. |
+| `--chunk-size` | L² chunk size (positive int, or `none`/`0`); default: `none` at 1 diffusion sample, else `64`. |
+| `--num-loops`, `--num-sampling-steps`, `--num-diffusion-samples` | Folding knobs (defaults: 20 / 200 / 1, matching `ESMFold2InputBuilder.fold()`). |
+| `--reproducible` | Make the run bit-reproducible: implies `--lm-dropout 0`, `--deterministic`, and `--seed 0` if unseeded. |
+| `--lm-dropout` | Per-loop LM dropout in [0, 1). Default: unset → esm's own default (0.3), which makes each fold a different draw. |
+| `--deterministic` | Force deterministic CUDA kernels (sets `CUBLAS_WORKSPACE_CONFIG=:4096:8`). |
+| `--seed` | Random seed (default: unset). |
 | `--gpu` | CUDA GPU index to target, 0-indexed (e.g. `--gpu 2` → `cuda:2`). Mutually exclusive with `--device`. |
 | `--device` | Explicit torch device (e.g. `cuda:1`, `cpu`). Default: `cuda` if available, else `cpu`. |
 | `--model` | Model repo id or local path (default: `biohub/ESMFold2`). |
 | `--stage-loading` | (Experimental) Load ESMC and the folding stack in separate stages so they're never co-resident on the GPU (lowest peak memory; identical output). May fail on some TransformerEngine builds — see the note above. |
 | `--no-offload-esmc` | Keep ESMC resident during folding (disables the memory optimization). Ignored under `--stage-loading`. |
 
-**Validating output parity.** The memory optimizations are designed to leave
-predictions unchanged. To confirm on your own hardware, `cookbook/esmfold2_parity.py`
-compares this fork's output against the original model code:
+**Reproducible folds with `--reproducible`.** By default ESMFold2 is a *sampler*,
+not a function: LM dropout (esm's default `0.3`) draws a fresh mask on every
+recycling loop, and the diffusion head is stochastic. Folding the same sequence
+twice therefore gives **different structures** — several Ångströms apart at long
+L. That is intentional upstream behaviour (it yields a diverse ensemble), but it
+makes "did my change alter the output?" impossible to answer directly.
+
+`--reproducible` pins all three sources of variation at once:
 
 ```bash
-# in-process: original model code vs this fork (same builder, weights, seed)
-python cookbook/esmfold2_parity.py --ab --gpu 0
+# fold, change code, fold again -> the .cif files should be byte-identical
+esmfold2-fold --fasta proteins.fasta --reproducible -o before
+esmfold2-fold --fasta proteins.fasta --reproducible -o after
+diff -r before after && echo "output unchanged"
 ```
 
-It checks pLDDT, PAE, pTM/ipTM (bit-exact) and the mmCIF text, and exits non-zero
-on any difference. For a full-pipeline check against a separate original
+It sets `--lm-dropout 0`, `--deterministic`, and `--seed 0` (keeping your `--seed`
+if you gave one), and prints what it changed. Combining it with a nonzero
+`--lm-dropout` is rejected rather than silently producing a non-reproducible run.
+At these settings output is bit-identical — verified at L=780, where all parity
+contrasts came out exactly 0.0000 Å.
+
+**Validating output parity.** The memory optimizations leave predictions
+unchanged. Verified at L=780: ESMC offloading and every model edit are
+**bit-identical** to the original code — all contrasts exactly 0.0000 Å RMSD,
+0 pLDDT, 0 pTM. To confirm on your own hardware:
+
+```bash
+# original model code vs this fork, x offload on/off (same weights, same seed)
+python cookbook/esmfold2_parity.py --matrix --gpu 0 --seq "$YOUR_SEQUENCE"
+```
+
+It reports superposed coordinate RMSD, pLDDT/pTM deltas, and peak/median GPU
+memory per configuration. For a full-pipeline check against a separate original
 checkout, use `--dump <file>` in each install and then `--compare a b`.
+
+Two things to know about interpreting it:
+
+- **The default gate is bit-exactness** (`--lm-dropout 0 --deterministic`, both
+  on by default). At that setting there is no tolerance to allow: any nonzero
+  RMSD is a real regression.
+- **`lm_dropout` makes the model a sampler.** It applies a fresh dropout mask per
+  recycling loop over the whole pair tensor, so with it on a single structure is a
+  *draw*, not a value — a one-element RNG shift yields a completely different
+  mask. Contrasts then measure which ensemble member was sampled, not parity; at
+  L=780 that produces 4–5 Å RMSD between configurations that are provably
+  bit-identical with dropout off. Pass `--lm-dropout 0.3` only to study the
+  ensemble spread itself.
+- **Gate on coordinate RMSD, not pLDDT/pTM.** Those are trunk-head outputs, not
+  measurements of the emitted coordinates, and stay flat even at 5+ Å of
+  coordinate divergence.
 
 ### Running ESMFold2 Through the Biohub Platform
 

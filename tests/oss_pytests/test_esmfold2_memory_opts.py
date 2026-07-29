@@ -573,3 +573,75 @@ def test_trimul_a1_bitexact_bf16_input_no_autocast_cuda():
     new = block(pair_grid, visibility)
     old = _trimul_forward_pre_a1(block, pair_grid, visibility)
     assert torch.equal(new, old)
+
+
+# ===========================================================================
+# lm_mask_pct cannot be honoured on a precomputed-LM path -> fail loudly
+# ===========================================================================
+# LM token masking happens inside the model's INLINE ESMC call. Supplying
+# lm_hidden_states makes forward() skip that call, so a nonzero lm_mask_pct would
+# be silently dropped -- giving different LM inputs (and one fewer L-dependent RNG
+# draw) than fold(). That is the quiet divergence these paths exist to avoid.
+
+
+class _NoMaskPctModel:
+    """Stands in for the vendored model: _compute_lm_hidden_states has no lm_mask_pct."""
+
+    def _compute_lm_hidden_states(self, input_ids, asym_id, residue_index, mol_type, tok_mask):
+        raise AssertionError("not called in these tests")
+
+
+class _MaskPctModel:
+    """Stands in for a model whose encode step CAN apply the masking."""
+
+    def _compute_lm_hidden_states(
+        self, input_ids, asym_id, residue_index, mol_type, tok_mask, lm_mask_pct=None
+    ):
+        raise AssertionError("not called in these tests")
+
+
+try:
+    from esm.models.esmfold2.processor import ESMFold2InputBuilder as _Builder
+
+    _HAVE_PROCESSOR, _PROC_ERR = True, ""
+except Exception as e:  # pragma: no cover - environment dependent
+    # processor.py pulls the full esm stack (Bio/rdkit/zstd/msa); skip rather
+    # than duplicate the guard's logic.
+    _Builder, _HAVE_PROCESSOR, _PROC_ERR = None, False, repr(e)
+
+processor_test = pytest.mark.skipif(
+    not _HAVE_PROCESSOR, reason=f"esm.models.esmfold2.processor not importable: {_PROC_ERR}"
+)
+
+
+def _reject(model, pct):
+    return _Builder._reject_unappliable_lm_mask_pct(model, pct)
+
+
+@processor_test
+@pytest.mark.parametrize("pct", [None, 0, 0.0, False])
+def test_lm_mask_pct_guard_noop_when_falsy(pct):
+    _reject(_NoMaskPctModel(), pct)  # must not raise
+
+
+@processor_test
+def test_lm_mask_pct_guard_allows_model_that_supports_it():
+    _reject(_MaskPctModel(), 0.15)  # encode can apply it -> fine
+
+
+@processor_test
+@pytest.mark.parametrize("pct", [0.15, 1.0])
+def test_lm_mask_pct_guard_raises_when_unappliable(pct):
+    with pytest.raises(ValueError, match="cannot be applied when ESMC embeddings"):
+        _reject(_NoMaskPctModel(), pct)
+
+
+@processor_test
+def test_lm_mask_pct_guard_survives_missing_method():
+    class Bare:
+        pass
+
+    # No _compute_lm_hidden_states at all -> still raises the clear error rather
+    # than an AttributeError from the introspection.
+    with pytest.raises(ValueError, match="cannot be applied"):
+        _reject(Bare(), 0.2)
